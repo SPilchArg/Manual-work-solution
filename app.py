@@ -2,7 +2,7 @@ import json
 import os
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -57,9 +57,87 @@ BORDER         = "#3a3b52"
 class Issue:
     article: str
     severity: str
+    rule_id: str
     rule: str
     evidence: str
     recommendation: str
+    source_refs: List[str] = field(default_factory=list)
+    source_files: List[str] = field(default_factory=list)
+
+
+def normalize_rule_id(value: str, fallback_idx: int) -> str:
+    rid = str(value or "").strip().upper()
+    if re.fullmatch(r"R\d+", rid):
+        return rid
+    return f"R{fallback_idx}"
+
+
+def coerce_str_list(value) -> List[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return []
+
+
+def build_source_catalog(
+    references: List[Tuple[str, str]],
+    spotchecks: List[Tuple[str, str]],
+) -> Dict[str, dict]:
+    catalog: Dict[str, dict] = {}
+    for idx, (name, _text) in enumerate(references, 1):
+        sid = f"REF{idx}"
+        catalog[sid] = {
+            "source_id": sid,
+            "source_type": "reference",
+            "file": name,
+        }
+    for idx, (name, _text) in enumerate(spotchecks, 1):
+        sid = f"SPOT{idx}"
+        catalog[sid] = {
+            "source_id": sid,
+            "source_type": "spotcheck",
+            "file": name,
+        }
+    return catalog
+
+
+def normalize_rules_bundle(
+    rules_bundle: dict,
+    references: List[Tuple[str, str]],
+    spotchecks: List[Tuple[str, str]],
+) -> dict:
+    source_catalog = build_source_catalog(references, spotchecks)
+    file_to_source = {
+        meta["file"].lower(): sid for sid, meta in source_catalog.items()
+    }
+    normalized_rules = []
+    raw_rules = rules_bundle.get("qa_rules", []) if isinstance(rules_bundle, dict) else []
+    for idx, rule in enumerate(raw_rules, 1):
+        if not isinstance(rule, dict):
+            continue
+        rule_id = normalize_rule_id(rule.get("rule_id", ""), idx)
+        source_refs = [s.upper() for s in coerce_str_list(rule.get("source_refs"))]
+        if not source_refs:
+            for doc_name in coerce_str_list(rule.get("source_docs")):
+                sid = file_to_source.get(doc_name.lower())
+                if sid:
+                    source_refs.append(sid)
+        source_refs = [s for s in source_refs if s in source_catalog]
+        source_files = [source_catalog[s]["file"] for s in source_refs]
+        normalized_rules.append({
+            "rule_id": rule_id,
+            "rule": str(rule.get("rule", "")).strip(),
+            "severity": str(rule.get("severity", "low")).strip().lower(),
+            "source": str(rule.get("source", "reference")).strip().lower(),
+            "source_refs": source_refs,
+            "source_files": source_files,
+        })
+    return {
+        "qa_rules": normalized_rules,
+        "summary": str((rules_bundle or {}).get("summary", "")),
+        "source_catalog": sorted(source_catalog.values(), key=lambda x: x["source_id"]),
+    }
 
 
 @dataclass
@@ -164,8 +242,14 @@ def call_gemini_summarize_refs(
     model: str,
     temperature: float,
 ) -> dict:
-    joined_refs = "\n\n".join([f"[REF] {n}\n{t[:15000]}" for n, t in references])
-    joined_spot = "\n\n".join([f"[SPOT] {n}\n{t[:15000]}" for n, t in spotchecks])
+    ref_blocks = []
+    for idx, (name, text) in enumerate(references, 1):
+        ref_blocks.append(f"[REF{idx}] {name}\n{text[:15000]}")
+    spot_blocks = []
+    for idx, (name, text) in enumerate(spotchecks, 1):
+        spot_blocks.append(f"[SPOT{idx}] {name}\n{text[:15000]}")
+    joined_refs = "\n\n".join(ref_blocks)
+    joined_spot = "\n\n".join(spot_blocks)
 
     prompt = f"""
 You are Agent 1 for QA rules extraction.
@@ -178,10 +262,20 @@ Task:
 JSON schema:
 {{
   "qa_rules": [
-    {{"rule_id": "R1", "rule": "...", "severity": "high|medium|low", "source": "reference|spotcheck|both"}}
+    {{
+      "rule_id": "R1",
+      "rule": "...",
+      "severity": "high|medium|low",
+      "source": "reference|spotcheck|both",
+      "source_refs": ["REF1", "SPOT1"]
+    }}
   ],
   "summary": "short summary"
 }}
+
+Important:
+- "source_refs" must use only IDs listed in the inputs (REF# and SPOT#).
+- Every rule must have at least one source_refs item.
 
 References:\n{joined_refs}\n\nInternal Spot Checks:\n{joined_spot}
 """
@@ -211,6 +305,14 @@ def call_claude_assess_article(
     temperature: float,
 ) -> "ArticleAssessment":
     rules_text = json.dumps(qa_rules, ensure_ascii=False, indent=2)
+    rules_by_id = {
+        str(r.get("rule_id", "")).strip().upper(): r
+        for r in qa_rules if isinstance(r, dict)
+    }
+    rules_by_text = {
+        str(r.get("rule", "")).strip().lower(): r
+        for r in qa_rules if isinstance(r, dict)
+    }
     prompt = f"""
 You are Agent 2 for article QA assessment.
 
@@ -222,12 +324,20 @@ Schema:
   "summary": "...",
   "readiness_score": 0,
   "issues": [
-    {{"severity": "high|medium|low", "rule": "...", "evidence": "exact sentence or phrase from the article that illustrates the problem", "recommendation": "..."}}
+    {{
+      "rule_id": "R1",
+      "severity": "high|medium|low",
+      "rule": "...",
+      "source_refs": ["REF1"],
+      "evidence": "exact sentence or phrase from the article that illustrates the problem",
+      "recommendation": "..."
+    }}
   ]
 }}
 
 Important: the "evidence" field must contain an exact quote (or very close paraphrase) from
 the article text so the annotation tool can locate and highlight it.
+Keep issue.rule_id and source_refs aligned with the supplied Rules JSON.
 
 Rules:\n{rules_text}\n\nArticle:\n{article_text[:40000]}
 """
@@ -248,16 +358,34 @@ Rules:\n{rules_text}\n\nArticle:\n{article_text[:40000]}
     if not parsed:
         raise ValueError(f"Claude response could not be parsed as JSON for {article_name}")
 
-    issues = [
-        Issue(
+    issues = []
+    for i in parsed.get("issues", []):
+        if not isinstance(i, dict):
+            continue
+        issue_rule_id = str(i.get("rule_id", "")).strip().upper()
+        issue_rule_text = str(i.get("rule", "")).strip()
+        matched_rule = rules_by_id.get(issue_rule_id) or rules_by_text.get(issue_rule_text.lower())
+        if matched_rule:
+            if not issue_rule_id:
+                issue_rule_id = str(matched_rule.get("rule_id", "")).strip().upper()
+            if not issue_rule_text:
+                issue_rule_text = str(matched_rule.get("rule", "")).strip()
+        source_refs = [s.upper() for s in coerce_str_list(i.get("source_refs"))]
+        if not source_refs and matched_rule:
+            source_refs = [s.upper() for s in coerce_str_list(matched_rule.get("source_refs"))]
+        source_files = []
+        if matched_rule:
+            source_files = coerce_str_list(matched_rule.get("source_files"))
+        issues.append(Issue(
             article=article_name,
             severity=str(i.get("severity", "low")),
-            rule=str(i.get("rule", "")),
+            rule_id=issue_rule_id,
+            rule=issue_rule_text,
             evidence=str(i.get("evidence", "")),
             recommendation=str(i.get("recommendation", "")),
-        )
-        for i in parsed.get("issues", [])
-    ]
+            source_refs=source_refs,
+            source_files=source_files,
+        ))
     return ArticleAssessment(
         article=parsed.get("article", article_name),
         summary=parsed.get("summary", ""),
@@ -274,14 +402,16 @@ def fallback_rules(
     references: List[Tuple[str, str]],
     spotchecks: List[Tuple[str, str]],
 ) -> dict:
+    spot1 = ["SPOT1"] if spotchecks else []
+    ref1 = ["REF1"] if references else []
     return {
         "qa_rules": [
             {"rule_id": "R1", "rule": "Brand names must match official casing.",
-             "severity": "high",   "source": "spotcheck"},
+             "severity": "high",   "source": "spotcheck", "source_refs": spot1},
             {"rule_id": "R2", "rule": "Terminology must align with reference materials.",
-             "severity": "high",   "source": "reference"},
+             "severity": "high",   "source": "reference", "source_refs": ref1},
             {"rule_id": "R3", "rule": "Tone and style must be consistent with internal guidance.",
-             "severity": "medium", "source": "both"},
+             "severity": "medium", "source": "both", "source_refs": ref1 + spot1},
         ],
         "summary": "Fallback rules generated because API step failed.",
     }
@@ -296,6 +426,7 @@ def fallback_assessment(
     if article_text and article_text.isupper():
         issues.append(Issue(
             article=article_name, severity="high",
+            rule_id="",
             rule="Excessive uppercase",
             evidence=article_text[:120],
             recommendation="Use sentence case unless brand-standard uppercase is required.",
@@ -303,6 +434,7 @@ def fallback_assessment(
     if len(article_text) < 80:
         issues.append(Issue(
             article=article_name, severity="medium",
+            rule_id="",
             rule="Insufficient content",
             evidence=article_text[:120] or "(empty)",
             recommendation="Ensure full article content is provided.",
@@ -310,6 +442,7 @@ def fallback_assessment(
     if not issues:
         issues.append(Issue(
             article=article_name, severity="low",
+            rule_id="",
             rule="Manual review recommended",
             evidence=article_text[:120] or "(empty)",
             recommendation="Run with valid API keys for full agentic assessment.",
@@ -480,6 +613,20 @@ def _paragraph_matches_issue(ptxt_lower: str, issue: Issue) -> bool:
     )
 
 
+def issue_sources_text(issue: Issue) -> str:
+    if issue.source_files:
+        return ", ".join(issue.source_files)
+    if issue.source_refs:
+        return ", ".join(issue.source_refs)
+    return "N/A"
+
+
+def issue_heading(issue: Issue) -> str:
+    if issue.rule_id:
+        return f"[{issue.severity.upper()}] {issue.rule_id} - {issue.rule}"
+    return f"[{issue.severity.upper()}] {issue.rule}"
+
+
 def create_annotated_docx(
     source_path: Path,
     out_path: Path,
@@ -528,7 +675,8 @@ def create_annotated_docx(
         comment_lines: List[str] = []
         for iss in matched:
             comment_lines.append(
-                f"[{iss.severity.upper()}] {iss.rule}\n"
+                f"{issue_heading(iss)}\n"
+                f"Source Material: {issue_sources_text(iss)}\n"
                 f"Evidence: {iss.evidence}\n"
                 f"Recommendation: {iss.recommendation}"
             )
@@ -551,7 +699,8 @@ def create_annotated_docx(
             comment_lines = ["[UNMATCHED ISSUES — could not be located in text]\n"]
             for iss in unmatched:
                 comment_lines.append(
-                    f"[{iss.severity.upper()}] {iss.rule}\n"
+                    f"{issue_heading(iss)}\n"
+                    f"Source Material: {issue_sources_text(iss)}\n"
                     f"Evidence: {iss.evidence}\n"
                     f"Recommendation: {iss.recommendation}"
                 )
@@ -581,7 +730,8 @@ def save_summary_docx(path: Path, assessments: List[ArticleAssessment]) -> None:
             doc.add_paragraph("Issues:")
             for idx, iss in enumerate(a.issues, 1):
                 doc.add_paragraph(
-                    f"  {idx}. [{iss.severity.upper()}] {iss.rule}\n"
+                    f"  {idx}. {issue_heading(iss)}\n"
+                    f"     Source Material: {issue_sources_text(iss)}\n"
                     f"     Evidence: {iss.evidence}\n"
                     f"     Recommendation: {iss.recommendation}",
                     style="List Bullet",
@@ -1172,6 +1322,7 @@ class App(tk.Tk):
                 self._log("GOOGLE_API_KEY not found — using fallback rules")
                 rules_bundle = fallback_rules(ref_payload, spot_payload)
 
+            rules_bundle = normalize_rules_bundle(rules_bundle, ref_payload, spot_payload)
             qa_rules = rules_bundle.get("qa_rules", [])
             save_json(out_dir / "qa_rules.json", rules_bundle)
             self._log(f"QA rules ready  ({len(qa_rules)} rule(s))")
@@ -1210,7 +1361,10 @@ class App(tk.Tk):
                 {
                     "article":        i.article,
                     "severity":       i.severity,
+                    "rule_id":        i.rule_id,
                     "rule":           i.rule,
+                    "source_refs":    i.source_refs,
+                    "source_files":   i.source_files,
                     "evidence":       i.evidence,
                     "recommendation": i.recommendation,
                 }
