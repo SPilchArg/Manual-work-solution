@@ -334,50 +334,42 @@ def fallback_assessment(
 
 def _ensure_comments_part(doc: Document):
     """
-    Return the comments XML root element (<w:comments>), creating and
-    relating the comments.xml part inside the package if it does not
-    yet exist.
+    Return the comments XML root element (<w:comments>).
+    Uses XmlPart so the lxml element is managed natively by python-docx
+    and serialised correctly on doc.save() without any blob patching.
     """
     import lxml.etree as etree
+    from docx.opc.part import XmlPart
+    from docx.opc.packuri import PackURI
 
     REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
     CT  = ("application/vnd.openxmlformats-officedocument"
            ".wordprocessingml.comments+xml")
-    PN  = "/word/comments.xml"
+    PN  = PackURI("/word/comments.xml")
 
-    COMMENTS_XML = (
-        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        b'<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
-        b' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        b'</w:comments>'
-    )
-
-    # ── check whether the relationship already exists ─────────────────────────
+    # ── return existing part if already related ───────────────────────────────
     for rel in doc.part.rels.values():
         if rel.reltype == REL:
-            # Part already exists — parse its blob and return the root element
-            target = rel._target
-            try:
-                return etree.fromstring(target.blob)
-            except Exception:
-                # blob may already be an etree internally in some builds
-                return target._element
+            return rel._target._element
 
-    # ── create a new comments.xml part ───────────────────────────────────────
-    part_obj = Part(
+    # ── build the root element directly in lxml ───────────────────────────────
+    WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    RNS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    root = etree.Element(
+        f"{{{WNS}}}comments",
+        nsmap={"w": WNS, "r": RNS},
+    )
+
+    # ── create an XmlPart so python-docx owns and serialises the element ──────
+    part_obj = XmlPart(
         partname=PN,
         content_type=CT,
-        blob=COMMENTS_XML,
+        element=root,
         package=doc.part.package,
     )
 
-    # Parse the element tree from the blob and attach it so later
-    # calls can retrieve the live element (with appended comments)
-    part_obj._element = etree.fromstring(COMMENTS_XML)
-
     doc.part.relate_to(part_obj, REL)
-
-    return part_obj._element
+    return root
 
 
 def _add_word_comment(
@@ -387,9 +379,10 @@ def _add_word_comment(
     author: str = "QA Reviewer",
     comment_id: int = 1,
 ) -> None:
-    import lxml.etree as etree
-
-    REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+    """
+    Attach a proper Word review comment to *paragraph*.
+    """
+    from datetime import timezone
 
     comments_root = _ensure_comments_part(doc)
 
@@ -397,9 +390,13 @@ def _add_word_comment(
     comment_elem = OxmlElement("w:comment")
     comment_elem.set(qn("w:id"),       str(comment_id))
     comment_elem.set(qn("w:author"),   author)
-    comment_elem.set(qn("w:date"),     datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+    comment_elem.set(
+        qn("w:date"),
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
     comment_elem.set(qn("w:initials"), "QA")
 
+    # paragraph inside the comment balloon
     cp  = OxmlElement("w:p")
     cpr = OxmlElement("w:pPr")
     cps = OxmlElement("w:pStyle")
@@ -407,6 +404,7 @@ def _add_word_comment(
     cpr.append(cps)
     cp.append(cpr)
 
+    # split multi-line comment into runs separated by line breaks
     lines = comment_text.split("\n")
     for line_idx, line in enumerate(lines):
         cr = OxmlElement("w:r")
@@ -429,19 +427,7 @@ def _add_word_comment(
     comment_elem.append(cp)
     comments_root.append(comment_elem)
 
-    # ── flush live element back to the part blob so it is saved ──────────────
-    for rel in doc.part.rels.values():
-        if rel.reltype == REL:
-            target = rel._target
-            target.blob = etree.tostring(
-                comments_root,
-                xml_declaration=True,
-                encoding="UTF-8",
-                standalone=True,
-            )
-            break
-
-    # ── wrap paragraph runs with range markers ────────────────────────────────
+    # ── wrap paragraph runs with commentRangeStart / End ─────────────────────
     p_elem = paragraph._p
 
     range_start = OxmlElement("w:commentRangeStart")
@@ -458,7 +444,7 @@ def _add_word_comment(
         p_elem.insert(0, range_start)
         p_elem.append(range_end)
 
-    # ── commentReference run ──────────────────────────────────────────────────
+    # ── commentReference run (draws the balloon anchor) ───────────────────────
     ref_run = OxmlElement("w:r")
     ref_rpr = OxmlElement("w:rPr")
     ref_rs  = OxmlElement("w:rStyle")
@@ -1209,7 +1195,7 @@ class App(tk.Tk):
                 else:
                     self._log(f"ANTHROPIC_API_KEY missing — fallback for {name}")
                     a = fallback_assessment(name, text, qa_rules)
-
+# test
                 assessments.append(a)
                 ann_path = annotated_dir / f"{source_path.stem}_annotated.docx"
                 create_annotated_docx(source_path, ann_path, a.issues)
