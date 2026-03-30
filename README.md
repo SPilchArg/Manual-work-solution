@@ -1,1 +1,0 @@
-# Manual-work-solution
