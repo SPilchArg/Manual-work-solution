@@ -2,35 +2,31 @@ import json
 import os
 import re
 import threading
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from docx import Document
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-from docx.enum.text import WD_COLOR_INDEX
-from docx.opc.part import Part
 from anthropic import Anthropic
-from google import genai
-from google.genai import types as genai_types
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+import lxml.etree as etree
 import yaml
 
-APP_TITLE = "Indeed Proto QA Reviewer"
-DEFAULT_ENV_CANDIDATES = [
-    r"C:\Internal Apps\MosAIQ LQA\MosAIQ-LQA\.env",
-    r"C:\Internal Apps\MosAIQ LQA\MosAIQ-LQA-GUI\.env",
-    r"C:\Internal Apps\MosAIQ LQA\MosAIQ-LQA-GUI-RECURSIVE\.env",
-    r"C:\Internal Apps\Terminology-Suite\.env",
-]
-WORD_COST_USD = 0.005
+APP_TITLE               = "Indeed Proto QA Reviewer"
+WORD_COST_USD           = 0.005
 DEFAULT_CLAUDE_MODEL_AGENT1 = "claude-opus-4-5"
 DEFAULT_CLAUDE_MODEL_AGENT2 = "claude-haiku-4-5"
-DEFAULT_MOSAIQ_CONFIG = Path(r"C:\Internal Apps\MosAIQ LQA\MosAIQ-LQA\config.yaml")
+DEFAULT_MOSAIQ_CONFIG   = Path(
+    r"C:\Internal Apps\MosAIQ LQA\MosAIQ-LQA\config.yaml"
+)
+MAX_WORKERS             = 6
+FP_CONFIDENCE_THRESHOLD = 0.65
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 BG_DARK        = "#1e1f2e"
@@ -54,102 +50,49 @@ BORDER         = "#3a3b52"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class Issue:
-    article: str
-    severity: str
-    rule_id: str
-    rule: str
-    evidence: str
-    recommendation: str
-    source_refs: List[str] = field(default_factory=list)
-    source_files: List[str] = field(default_factory=list)
-
-
-def normalize_rule_id(value: str, fallback_idx: int) -> str:
-    rid = str(value or "").strip().upper()
-    if re.fullmatch(r"R\d+", rid):
-        return rid
-    return f"R{fallback_idx}"
-
-
-def coerce_str_list(value) -> List[str]:
-    if isinstance(value, list):
-        return [str(v).strip() for v in value if str(v).strip()]
-    if isinstance(value, str):
-        return [value.strip()] if value.strip() else []
-    return []
-
-
-def build_source_catalog(
-    references: List[Tuple[str, str]],
-    spotchecks: List[Tuple[str, str]],
-) -> Dict[str, dict]:
-    catalog: Dict[str, dict] = {}
-    for idx, (name, _text) in enumerate(references, 1):
-        sid = f"REF{idx}"
-        catalog[sid] = {
-            "source_id": sid,
-            "source_type": "reference",
-            "file": name,
-        }
-    for idx, (name, _text) in enumerate(spotchecks, 1):
-        sid = f"SPOT{idx}"
-        catalog[sid] = {
-            "source_id": sid,
-            "source_type": "spotcheck",
-            "file": name,
-        }
-    return catalog
-
-
-def normalize_rules_bundle(
-    rules_bundle: dict,
-    references: List[Tuple[str, str]],
-    spotchecks: List[Tuple[str, str]],
-) -> dict:
-    source_catalog = build_source_catalog(references, spotchecks)
-    file_to_source = {
-        meta["file"].lower(): sid for sid, meta in source_catalog.items()
-    }
-    normalized_rules = []
-    raw_rules = rules_bundle.get("qa_rules", []) if isinstance(rules_bundle, dict) else []
-    for idx, rule in enumerate(raw_rules, 1):
-        if not isinstance(rule, dict):
-            continue
-        rule_id = normalize_rule_id(rule.get("rule_id", ""), idx)
-        source_refs = [s.upper() for s in coerce_str_list(rule.get("source_refs"))]
-        if not source_refs:
-            for doc_name in coerce_str_list(rule.get("source_docs")):
-                sid = file_to_source.get(doc_name.lower())
-                if sid:
-                    source_refs.append(sid)
-        source_refs = [s for s in source_refs if s in source_catalog]
-        source_files = [source_catalog[s]["file"] for s in source_refs]
-        normalized_rules.append({
-            "rule_id": rule_id,
-            "rule": str(rule.get("rule", "")).strip(),
-            "severity": str(rule.get("severity", "low")).strip().lower(),
-            "source": str(rule.get("source", "reference")).strip().lower(),
-            "source_refs": source_refs,
-            "source_files": source_files,
-        })
-    return {
-        "qa_rules": normalized_rules,
-        "summary": str((rules_bundle or {}).get("summary", "")),
-        "source_catalog": sorted(source_catalog.values(), key=lambda x: x["source_id"]),
-    }
+class XliffSegment:
+    seg_id:    str
+    source:    str
+    target:    str
+    state:     str
+    file_name: str
+    doc_id:    str = ""
+    seg_seq:   str = ""
+    extra:     Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class ArticleAssessment:
-    article: str
-    summary: str
-    readiness_score: float
-    issues: List[Issue]
+class MosaiqIssue:
+    row_index:   int
+    seg_id:      str
+    source_text: str
+    target_text: str
+    error_type:  str
+    severity:    str
+    comment:     str
+    doc_id:      str = ""
+    seg_seq:     str = ""
+    seg_info:    str = ""
+    fp:          str = ""
+    issue_sign:  str = ""
+    issue_group: str = ""
+    extra:       Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EvaluatedSegment:
+    segment:           XliffSegment
+    has_issue:         bool
+    is_false_positive: bool
+    ai_confidence:     float
+    ai_issue:          str
+    ai_comment:        str
+    ai_rationale:      str
+    matched_mosaiq:    Optional[MosaiqIssue] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Generic helpers
+#  Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def safe_json_loads(text: str) -> Optional[dict]:
@@ -167,36 +110,19 @@ def safe_json_loads(text: str) -> Optional[dict]:
 
 
 def load_env_file(path: Path) -> Dict[str, str]:
-    env = {}
+    env: Dict[str, str] = {}
     if not path.exists():
         return env
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        env[key.strip()] = value.strip().strip('"').strip("'")
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception:
+        pass
     return env
-
-
-def first_existing_env(candidates: List[str]) -> Optional[Path]:
-    for candidate in candidates:
-        p = Path(candidate)
-        if p.exists():
-            return p
-    return None
-
-
-def list_docx(folder: Path) -> List[Path]:
-    if not folder.exists():
-        return []
-    return sorted(p for p in folder.rglob("*.docx") if not p.name.startswith("~$"))
-
-
-def docx_to_text(path: Path) -> str:
-    doc = Document(str(path))
-    lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    return "\n".join(lines)
 
 
 def word_count(text: str) -> int:
@@ -204,8 +130,14 @@ def word_count(text: str) -> int:
 
 
 def save_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 def load_agent_settings(config_path: Path) -> dict:
@@ -231,556 +163,739 @@ def load_agent_settings(config_path: Path) -> dict:
     return settings
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Agent API calls
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def call_claude_extract_rules(
-    api_key: str,
-    references: List[Tuple[str, str]],
-    spotchecks: List[Tuple[str, str]],
-    model: str,
-    temperature: float,
-) -> dict:
-    joined_refs = "\n\n".join([f"[REF] {n}\n{t[:15000]}" for n, t in references])
-    joined_spot = "\n\n".join([f"[SPOT] {n}\n{t[:15000]}" for n, t in spotchecks])
-
-    prompt = f"""
-You are Agent 1 for QA rules extraction.
-
-Task:
-1) Read references and internal spot checks.
-2) Generate a concise list of QA rules/checkpoints.
-3) Return JSON only, no extra text.
-
-JSON schema:
-{{
-  "qa_rules": [
-    {{"rule_id": "R1", "rule": "...", "severity": "high|medium|low", "source": "reference|spotcheck|both"}}
-  ],
-  "summary": "short summary"
-}}
-
-References:\n{joined_refs}\n\nInternal Spot Checks:\n{joined_spot}
-"""
-    client = Anthropic(api_key=api_key)
-    msg    = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text_blocks = [
-        getattr(item, "text", "")
-        for item in msg.content
-        if getattr(item, "type", "") == "text"
-    ]
-    text   = "\n".join(text_blocks)
-    parsed = safe_json_loads(text)
-    if not parsed:
-        raise ValueError("Claude Agent 1 response could not be parsed as JSON")
-    return parsed
+def instructions_to_json(text: str, source_file: str) -> dict:
+    return {"source_file": source_file, "instructions": text}
 
 
-def call_claude_assess_article(
-    api_key: str,
-    article_name: str,
-    article_text: str,
-    qa_rules: List[dict],
-    model: str,
-    temperature: float,
-) -> "ArticleAssessment":
-    rules_text = json.dumps(qa_rules, ensure_ascii=False, indent=2)
-    rules_by_id = {
-        str(r.get("rule_id", "")).strip().upper(): r
-        for r in qa_rules if isinstance(r, dict)
-    }
-    rules_by_text = {
-        str(r.get("rule", "")).strip().lower(): r
-        for r in qa_rules if isinstance(r, dict)
-    }
-    prompt = f"""
-You are Agent 2 for article QA assessment.
-
-Assess the article against the QA rules below. Return JSON only.
-
-Schema:
-{{
-  "article": "{article_name}",
-  "summary": "...",
-  "readiness_score": 0,
-  "issues": [
-    {{
-      "rule_id": "R1",
-      "severity": "high|medium|low",
-      "rule": "...",
-      "source_refs": ["REF1"],
-      "evidence": "exact sentence or phrase from the article that illustrates the problem",
-      "recommendation": "..."
-    }}
-  ]
-}}
-
-Important: the "evidence" field must contain an exact quote (or very close paraphrase) from
-the article text so the annotation tool can locate and highlight it.
-Keep issue.rule_id and source_refs aligned with the supplied Rules JSON.
-
-Rules:\n{rules_text}\n\nArticle:\n{article_text[:40000]}
-"""
-    client = Anthropic(api_key=api_key)
-    msg    = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text_blocks = [
-        getattr(item, "text", "")
-        for item in msg.content
-        if getattr(item, "type", "") == "text"
-    ]
-    text   = "\n".join(text_blocks)
-    parsed = safe_json_loads(text)
-    if not parsed:
-        raise ValueError(f"Claude response could not be parsed as JSON for {article_name}")
-
-    issues = []
-    for i in parsed.get("issues", []):
-        if not isinstance(i, dict):
-            continue
-        issue_rule_id = str(i.get("rule_id", "")).strip().upper()
-        issue_rule_text = str(i.get("rule", "")).strip()
-        matched_rule = rules_by_id.get(issue_rule_id) or rules_by_text.get(issue_rule_text.lower())
-        if matched_rule:
-            if not issue_rule_id:
-                issue_rule_id = str(matched_rule.get("rule_id", "")).strip().upper()
-            if not issue_rule_text:
-                issue_rule_text = str(matched_rule.get("rule", "")).strip()
-        source_refs = [s.upper() for s in coerce_str_list(i.get("source_refs"))]
-        if not source_refs and matched_rule:
-            source_refs = [s.upper() for s in coerce_str_list(matched_rule.get("source_refs"))]
-        source_files = []
-        if matched_rule:
-            source_files = coerce_str_list(matched_rule.get("source_files"))
-        issues.append(Issue(
-            article=article_name,
-            severity=str(i.get("severity", "low")),
-            rule_id=issue_rule_id,
-            rule=issue_rule_text,
-            evidence=str(i.get("evidence", "")),
-            recommendation=str(i.get("recommendation", "")),
-            source_refs=source_refs,
-            source_files=source_files,
-        ))
-    return ArticleAssessment(
-        article=parsed.get("article", article_name),
-        summary=parsed.get("summary", ""),
-        readiness_score=float(parsed.get("readiness_score", 0)),
-        issues=issues,
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Fallbacks (no API key / API failure)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def fallback_rules(
-    references: List[Tuple[str, str]],
-    spotchecks: List[Tuple[str, str]],
-) -> dict:
-    spot1 = ["SPOT1"] if spotchecks else []
-    ref1 = ["REF1"] if references else []
+def segments_to_json(segments: List[XliffSegment]) -> dict:
     return {
-        "qa_rules": [
-            {"rule_id": "R1", "rule": "Brand names must match official casing.",
-             "severity": "high",   "source": "spotcheck", "source_refs": spot1},
-            {"rule_id": "R2", "rule": "Terminology must align with reference materials.",
-             "severity": "high",   "source": "reference", "source_refs": ref1},
-            {"rule_id": "R3", "rule": "Tone and style must be consistent with internal guidance.",
-             "severity": "medium", "source": "both", "source_refs": ref1 + spot1},
-        ],
-        "summary": "Fallback rules generated because API step failed.",
+        "segments": [
+            {
+                "seg_id":    s.seg_id,
+                "source":    s.source,
+                "target":    s.target,
+                "state":     s.state,
+                "file_name": s.file_name,
+                "doc_id":    s.doc_id,
+                "seg_seq":   s.seg_seq,
+                **s.extra,
+            }
+            for s in segments
+        ]
     }
 
 
-def fallback_assessment(
-    article_name: str,
-    article_text: str,
-    qa_rules: List[dict],
-) -> ArticleAssessment:
-    issues: List[Issue] = []
-    if article_text and article_text.isupper():
-        issues.append(Issue(
-            article=article_name, severity="high",
-            rule_id="",
-            rule="Excessive uppercase",
-            evidence=article_text[:120],
-            recommendation="Use sentence case unless brand-standard uppercase is required.",
-        ))
-    if len(article_text) < 80:
-        issues.append(Issue(
-            article=article_name, severity="medium",
-            rule_id="",
-            rule="Insufficient content",
-            evidence=article_text[:120] or "(empty)",
-            recommendation="Ensure full article content is provided.",
-        ))
+def _results_to_json_list(results: List[EvaluatedSegment]) -> list:
+    """
+    Convert evaluated segments to a serialisable list.
+    Kept as a standalone function so it is never nested inside a try block.
+    """
+    rows = []
+    for r in results:
+        if r.has_issue:
+            disposition = "real_error"
+        elif r.is_false_positive and r.ai_confidence >= FP_CONFIDENCE_THRESHOLD:
+            disposition = "fp_excluded"
+        elif r.is_false_positive:
+            disposition = "fp_low_conf"
+        else:
+            disposition = "clean"
+
+        rows.append({
+            "seg_id":            r.segment.seg_id,
+            "doc_id":            r.segment.doc_id,
+            "seg_seq":           r.segment.seg_seq,
+            "source":            r.segment.source,
+            "target":            r.segment.target,
+            "state":             r.segment.state,
+            "has_issue":         r.has_issue,
+            "is_false_positive": r.is_false_positive,
+            "ai_confidence":     r.ai_confidence,
+            "ai_issue":          r.ai_issue,
+            "ai_comment":        r.ai_comment,
+            "ai_rationale":      r.ai_rationale,
+            "disposition":       disposition,
+        })
+    return rows
+
+
+def _build_file_json(
+    ts:           str,
+    xp:           Path,
+    inst_path:    Path,
+    report_path:  Path,
+    model:        str,
+    results:      List[EvaluatedSegment],
+    error_cnt:    int,
+    excl_cnt:     int,
+    low_conf_cnt: int,
+    clean_cnt:    int,
+    total_words:  int,
+) -> dict:
+    return {
+        "run_timestamp":      ts,
+        "xliff_file":         str(xp),
+        "instructions":       str(inst_path),
+        "mosaiq_report":      str(report_path),
+        "model":              model,
+        "workers":            MAX_WORKERS,
+        "fp_threshold":       FP_CONFIDENCE_THRESHOLD,
+        "total_segments":     len(results),
+        "qa_report_rows":     error_cnt,       # real errors only
+        "exclusions_rows":    excl_cnt,        # everything else
+        "low_conf_fp":        low_conf_cnt,    # subset of exclusions (yellow)
+        "clean_count":        clean_cnt,       # subset of exclusions (green)
+        "total_words":        total_words,
+        "estimated_cost_usd": round(total_words * WORD_COST_USD, 4),
+        "segments":           _results_to_json_list(results),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  XLIFF Parser
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _strip_ns(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _text_of(elem: etree._Element) -> str:
+    return (etree.tostring(elem, method="text", encoding="unicode") or "").strip()
+
+
+class XliffParser:
+
+    def parse(self, path: Path) -> List[XliffSegment]:
+        try:
+            tree = etree.parse(str(path))
+            root = tree.getroot()
+        except etree.XMLSyntaxError as exc:
+            raise ValueError(f"XML parse error in {path.name}: {exc}") from exc
+
+        root_local = _strip_ns(root.tag)
+        if root_local == "xliff":
+            return self._parse_xliff(root, path.name)
+        raise ValueError(f"Unrecognised root element <{root_local}> in {path.name}")
+
+    def _parse_xliff(
+        self, root: etree._Element, file_name: str
+    ) -> List[XliffSegment]:
+        segments:    List[XliffSegment] = []
+        seq_counter: int                = 0
+
+        for file_elem in root.iter():
+            if _strip_ns(file_elem.tag) != "file":
+                continue
+            doc_id = file_elem.get("original", file_name)
+
+            for tu in file_elem.iter():
+                if _strip_ns(tu.tag) != "trans-unit":
+                    continue
+
+                tu_id       = tu.get("id", "")
+                source_text = ""
+                target_text = ""
+                state       = ""
+
+                for child in tu:
+                    local = _strip_ns(child.tag)
+                    if local == "source":
+                        source_text = _text_of(child)
+                    elif local == "target":
+                        target_text = _text_of(child)
+                        state       = child.get("state", "")
+
+                sdl_segs = self._extract_sdl_segments(tu)
+                if sdl_segs:
+                    for seg in sdl_segs:
+                        seq_counter += 1
+                        segments.append(XliffSegment(
+                            seg_id    = seg.seg_id,
+                            source    = seg.source    or source_text,
+                            target    = seg.target    or target_text,
+                            state     = seg.state     or state,
+                            file_name = file_name,
+                            doc_id    = doc_id,
+                            seg_seq   = str(seq_counter),
+                            extra     = seg.extra,
+                        ))
+                else:
+                    if source_text or target_text:
+                        seq_counter += 1
+                        segments.append(XliffSegment(
+                            seg_id    = tu_id,
+                            source    = source_text,
+                            target    = target_text,
+                            state     = state,
+                            file_name = file_name,
+                            doc_id    = doc_id,
+                            seg_seq   = str(seq_counter),
+                        ))
+
+        return segments
+
+    def _extract_sdl_segments(
+        self, tu: etree._Element
+    ) -> List[XliffSegment]:
+        seg_sources: Dict[str, str] = {}
+        seg_targets: Dict[str, str] = {}
+        seg_states:  Dict[str, str] = {}
+
+        for child in tu:
+            local = _strip_ns(child.tag)
+            if local == "seg-source":
+                for mrk in child.iter():
+                    if _strip_ns(mrk.tag) == "mrk" and mrk.get("mtype") == "seg":
+                        mid              = mrk.get("mid", "")
+                        seg_sources[mid] = _text_of(mrk)
+            elif local == "target":
+                for mrk in child.iter():
+                    if _strip_ns(mrk.tag) == "mrk" and mrk.get("mtype") == "seg":
+                        mid   = mrk.get("mid", "")
+                        state = (
+                            mrk.get("{http://sdl.com/FileTypes/SdlXliff/1.0}state", "")
+                            or mrk.get("state", "")
+                        )
+                        seg_targets[mid] = _text_of(mrk)
+                        if state:
+                            seg_states[mid] = state
+
+        all_mids: List[str] = sorted(set(list(seg_sources) + list(seg_targets)))
+        segments: List[XliffSegment] = []
+        for mid in all_mids:
+            tu_id  = tu.get("id", "")
+            seg_id = f"{tu_id}::{mid}" if mid else tu_id
+            segments.append(XliffSegment(
+                seg_id    = seg_id,
+                source    = seg_sources.get(mid, ""),
+                target    = seg_targets.get(mid, ""),
+                state     = seg_states.get(mid, ""),
+                file_name = "",
+                doc_id    = "",
+                seg_seq   = "",
+                extra     = {"tu_id": tu_id, "mrk_mid": mid},
+            ))
+        return segments
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MosAIQ Report Reader  (context only)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MosaiqReportReader:
+    _COL_MAP: Dict[str, str] = {
+        "doc-id":      "doc_id",
+        "seg-seq":     "seg_seq",
+        "seg-id":      "seg_id",
+        "seg-info":    "seg_info",
+        "source":      "source_text",
+        "target":      "target_text",
+        "fp":          "fp",
+        "comment":     "comment",
+        "issue sign":  "issue_sign",
+        "issue group": "issue_group",
+        "seg":         "seg_id",
+        "seg id":      "seg_id",
+        "segment id":  "seg_id",
+        "id":          "seg_id",
+        "source text": "source_text",
+        "src":         "source_text",
+        "target text": "target_text",
+        "tgt":         "target_text",
+        "translation": "target_text",
+        "error":       "error_type",
+        "error type":  "error_type",
+        "issue":       "error_type",
+        "issue type":  "error_type",
+        "category":    "error_type",
+        "check":       "error_type",
+        "rule":        "error_type",
+        "severity":    "severity",
+        "level":       "severity",
+        "weight":      "severity",
+        "note":        "comment",
+        "description": "comment",
+        "message":     "comment",
+        "detail":      "comment",
+    }
+
+    def read(self, path: Path) -> Tuple[List[MosaiqIssue], List[str], int]:
+        try:
+            wb   = load_workbook(str(path), read_only=True, data_only=True)
+            ws   = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            wb.close()
+        except Exception as exc:
+            raise ValueError(f"Could not read MosAIQ report: {exc}") from exc
+
+        if not rows:
+            return [], [], 0
+
+        header_idx = 0
+        for i, row in enumerate(rows[:20]):
+            non_empty = [c for c in row if c and isinstance(c, str)]
+            if len(non_empty) >= 2:
+                header_idx = i
+                break
+
+        header    = [str(c or "").strip() for c in rows[header_idx]]
+        col_map:  Dict[int, str] = {}
+        assigned: set            = set()
+
+        for col_idx, col_name in enumerate(header):
+            canonical = self._COL_MAP.get(col_name.lower())
+            if canonical and canonical not in assigned:
+                col_map[col_idx] = canonical
+                assigned.add(canonical)
+
+        issues: List[MosaiqIssue] = []
+        for row_idx, row in enumerate(
+            rows[header_idx + 1:], start=header_idx + 2
+        ):
+            if all(c is None or str(c).strip() == "" for c in row):
+                continue
+
+            mapped: Dict[str, str] = {}
+            extra:  Dict[str, Any] = {}
+
+            for col_idx, cell_val in enumerate(row):
+                val       = str(cell_val).strip() if cell_val is not None else ""
+                canonical = col_map.get(col_idx)
+                if canonical:
+                    mapped[canonical] = val
+                else:
+                    col_name = (
+                        header[col_idx]
+                        if col_idx < len(header)
+                        else f"col_{col_idx}"
+                    )
+                    extra[col_name] = val
+
+            issues.append(MosaiqIssue(
+                row_index   = row_idx,
+                seg_id      = mapped.get("seg_id",      ""),
+                source_text = mapped.get("source_text", ""),
+                target_text = mapped.get("target_text", ""),
+                error_type  = mapped.get("error_type",  ""),
+                severity    = mapped.get("severity",    ""),
+                comment     = mapped.get("comment",     ""),
+                doc_id      = mapped.get("doc_id",      ""),
+                seg_seq     = mapped.get("seg_seq",     ""),
+                seg_info    = mapped.get("seg_info",    ""),
+                fp          = mapped.get("fp",          ""),
+                issue_sign  = mapped.get("issue_sign",  ""),
+                issue_group = mapped.get("issue_group", ""),
+                extra       = extra,
+            ))
+
+        return issues, header, header_idx
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Instructions parser
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_instructions_docx(path: Path) -> str:
+    doc   = Document(str(path))
+    lines = []
+    for para in doc.paragraphs:
+        t = para.text.strip()
+        if t:
+            lines.append(t)
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AI evaluation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_EVAL_SYSTEM = """\
+You are a senior translation quality-assurance specialist reviewing SDL XLIFF
+translation segments.
+
+Your job:
+1. Examine the SOURCE and TARGET text of the XLIFF segment.
+2. Using the client/project instructions AND the sample MosAIQ error patterns
+   as guidance, decide whether the TARGET contains a genuine translation error.
+3. Pay special attention to metric/imperial unit conversions (mm, cm, m, km,
+   in, ft, yd, mi, degrees C, degrees F, kg, lb, oz, etc.).
+
+Definitions
+-----------
+has_issue         : true  = the target text has a real translation problem.
+is_false_positive : true  = an automated QA tool flagged this segment, but
+                            the translation is actually correct.
+                            Set ONLY when has_issue is false.
+ai_confidence     : how confident YOU are in YOUR verdict (0.0 = not at all,
+                    1.0 = certain).
+
+Return ONLY valid JSON, no markdown, no extra text.
+{
+  "has_issue":         true | false,
+  "is_false_positive": true | false,
+  "ai_confidence":     0.0 to 1.0,
+  "ai_issue":          "Brief label e.g. Incorrect unit conversion or None",
+  "ai_comment":        "One-sentence QA warning or clearance note.",
+  "ai_rationale":      "Two-to-four sentences explaining your decision."
+}
+"""
+
+
+def _summarise_mosaiq_context(
+    issues: List[MosaiqIssue], max_examples: int = 8
+) -> str:
     if not issues:
-        issues.append(Issue(
-            article=article_name, severity="low",
-            rule_id="",
-            rule="Manual review recommended",
-            evidence=article_text[:120] or "(empty)",
-            recommendation="Run with valid API keys for full agentic assessment.",
-        ))
-    score = max(
-        0,
-        100
-        - len([i for i in issues if i.severity == "high"])   * 25
-        - len([i for i in issues if i.severity == "medium"]) * 10,
-    )
-    return ArticleAssessment(
-        article=article_name,
-        summary="Fallback assessment used.",
-        readiness_score=score,
-        issues=issues,
-    )
+        return "No MosAIQ reference data available."
+
+    lines = ["MosAIQ QA error-pattern reference (sample):"]
+    seen_types: Dict[str, int] = {}
+    for iss in issues:
+        et = iss.error_type or iss.issue_group or "Unknown"
+        seen_types[et] = seen_types.get(et, 0) + 1
+
+    lines.append("Error-type frequency in this report:")
+    for et, cnt in sorted(seen_types.items(), key=lambda x: -x[1])[:10]:
+        lines.append(f"  - {et}: {cnt} occurrence(s)")
+
+    lines.append("\nExample flagged segments (for pattern reference only):")
+    shown = 0
+    for iss in issues:
+        if shown >= max_examples:
+            break
+        if not iss.source_text and not iss.target_text:
+            continue
+        lines.append(
+            f"  [{iss.error_type or iss.issue_group}] "
+            f"SRC: {iss.source_text[:120]} | "
+            f"TGT: {iss.target_text[:120]} | "
+            f"Comment: {iss.comment[:80]}"
+        )
+        shown += 1
+
+    return "\n".join(lines)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DOCX annotation with real Word comments
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _ensure_comments_part(doc: Document):
-    """
-    Return the comments XML root element (<w:comments>).
-    Uses XmlPart so the lxml element is managed natively by python-docx
-    and serialised correctly on doc.save() without any blob patching.
-    """
-    import lxml.etree as etree
-    from docx.opc.part import XmlPart
-    from docx.opc.packuri import PackURI
-
-    REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
-    CT  = ("application/vnd.openxmlformats-officedocument"
-           ".wordprocessingml.comments+xml")
-    PN  = PackURI("/word/comments.xml")
-
-    # ── return existing part if already related ───────────────────────────────
-    for rel in doc.part.rels.values():
-        if rel.reltype == REL:
-            return rel._target._element
-
-    # ── build the root element directly in lxml ───────────────────────────────
-    WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    RNS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    root = etree.Element(
-        f"{{{WNS}}}comments",
-        nsmap={"w": WNS, "r": RNS},
-    )
-
-    # ── create an XmlPart so python-docx owns and serialises the element ──────
-    part_obj = XmlPart(
-        partname=PN,
-        content_type=CT,
-        element=root,
-        package=doc.part.package,
-    )
-
-    doc.part.relate_to(part_obj, REL)
-    return root
-
-
-def _add_word_comment(
-    doc: Document,
-    paragraph,
-    comment_text: str,
-    author: str = "QA Reviewer",
-    comment_id: int = 1,
-) -> None:
-    """
-    Attach a proper Word review comment to *paragraph*.
-    """
-    from datetime import timezone
-
-    comments_root = _ensure_comments_part(doc)
-
-    # ── build <w:comment> ─────────────────────────────────────────────────────
-    comment_elem = OxmlElement("w:comment")
-    comment_elem.set(qn("w:id"),       str(comment_id))
-    comment_elem.set(qn("w:author"),   author)
-    comment_elem.set(
-        qn("w:date"),
-        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    )
-    comment_elem.set(qn("w:initials"), "QA")
-
-    # paragraph inside the comment balloon
-    cp  = OxmlElement("w:p")
-    cpr = OxmlElement("w:pPr")
-    cps = OxmlElement("w:pStyle")
-    cps.set(qn("w:val"), "CommentText")
-    cpr.append(cps)
-    cp.append(cpr)
-
-    # split multi-line comment into runs separated by line breaks
-    lines = comment_text.split("\n")
-    for line_idx, line in enumerate(lines):
-        cr = OxmlElement("w:r")
-        if line_idx == 0:
-            rpr = OxmlElement("w:rPr")
-            rs  = OxmlElement("w:rStyle")
-            rs.set(qn("w:val"), "CommentReference")
-            rpr.append(rs)
-            cr.append(rpr)
-        ct = OxmlElement("w:t")
-        ct.text = line
-        ct.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-        cr.append(ct)
-        cp.append(cr)
-        if line_idx < len(lines) - 1:
-            br_run = OxmlElement("w:r")
-            br_run.append(OxmlElement("w:br"))
-            cp.append(br_run)
-
-    comment_elem.append(cp)
-    comments_root.append(comment_elem)
-
-    # ── wrap paragraph runs with commentRangeStart / End ─────────────────────
-    p_elem = paragraph._p
-
-    range_start = OxmlElement("w:commentRangeStart")
-    range_start.set(qn("w:id"), str(comment_id))
-
-    range_end = OxmlElement("w:commentRangeEnd")
-    range_end.set(qn("w:id"), str(comment_id))
-
-    runs = p_elem.findall(qn("w:r"))
-    if runs:
-        runs[0].addprevious(range_start)
-        runs[-1].addnext(range_end)
-    else:
-        p_elem.insert(0, range_start)
-        p_elem.append(range_end)
-
-    # ── commentReference run (draws the balloon anchor) ───────────────────────
-    ref_run = OxmlElement("w:r")
-    ref_rpr = OxmlElement("w:rPr")
-    ref_rs  = OxmlElement("w:rStyle")
-    ref_rs.set(qn("w:val"), "CommentReference")
-    ref_rpr.append(ref_rs)
-    ref_run.append(ref_rpr)
-
-    comment_ref = OxmlElement("w:commentReference")
-    comment_ref.set(qn("w:id"), str(comment_id))
-    ref_run.append(comment_ref)
-
-    range_end.addnext(ref_run)
-
-
-def _highlight_paragraph(paragraph) -> None:
-    """Yellow-highlight every run in a paragraph."""
-    for run in paragraph.runs:
-        run.font.highlight_color = WD_COLOR_INDEX.YELLOW
-
-
-def _paragraph_matches_issue(ptxt_lower: str, issue: Issue) -> bool:
-    """
-    Return True when the paragraph text is likely the location of *issue*.
-    Checks:
-      1. An exact substring of the evidence (first 80 chars) appears in the paragraph.
-      2. The rule keyword appears in the paragraph.
-    """
-    evidence_snippet = issue.evidence.strip().lower()[:80]
-    rule_snippet     = issue.rule.strip().lower()
+def _build_segment_prompt(
+    segment:        XliffSegment,
+    instructions:   str,
+    mosaiq_context: str,
+) -> str:
     return (
-        (evidence_snippet and evidence_snippet in ptxt_lower)
-        or (rule_snippet   and rule_snippet   in ptxt_lower)
+        f"PROJECT / CLIENT INSTRUCTIONS:\n"
+        f"{instructions[:5000]}\n\n"
+        f"{mosaiq_context}\n\n"
+        f"XLIFF SEGMENT TO EVALUATE:\n"
+        f"  File    : {segment.file_name}\n"
+        f"  Doc-ID  : {segment.doc_id}\n"
+        f"  Seg-Seq : {segment.seg_seq}\n"
+        f"  Seg-ID  : {segment.seg_id}\n"
+        f"  State   : {segment.state}\n"
+        f"  Source  : {segment.source}\n"
+        f"  Target  : {segment.target}\n\n"
+        f"Evaluate the TARGET translation and return JSON as specified."
     )
 
 
-def issue_sources_text(issue: Issue) -> str:
-    if issue.source_files:
-        return ", ".join(issue.source_files)
-    if issue.source_refs:
-        return ", ".join(issue.source_refs)
-    return "N/A"
-
-
-def issue_heading(issue: Issue) -> str:
-    if issue.rule_id:
-        return f"[{issue.severity.upper()}] {issue.rule_id} - {issue.rule}"
-    return f"[{issue.severity.upper()}] {issue.rule}"
-
-
-def create_annotated_docx(
-    source_path: Path,
-    out_path: Path,
-    issues: List[Issue],
-) -> None:
-    """
-    Saves an annotated copy of *source_path* to *out_path*.
-
-    For every issue whose evidence can be located in a paragraph:
-      • The paragraph text is highlighted yellow.
-      • A proper Word review comment (visible in the Review pane / comment
-        balloons) is attached to that paragraph.
-
-    Issues that could not be matched to a specific paragraph are collected
-    into a single summary comment on the first paragraph so they are never
-    silently lost.
-    """
-    doc = Document(str(source_path))
-
-    if not issues:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(str(out_path))
-        return
-
-    comment_id    = 1
-    unmatched     = list(issues)   # shrinks as we match issues to paragraphs
-
-    for paragraph in doc.paragraphs:
-        ptxt = paragraph.text.strip()
-        if not ptxt:
-            continue
-
-        ptxt_lower = ptxt.lower()
-        matched    = [iss for iss in issues if _paragraph_matches_issue(ptxt_lower, iss)]
-
-        if not matched:
-            continue
-
-        # Remove matched issues from the unmatched pool
-        for iss in matched:
-            if iss in unmatched:
-                unmatched.remove(iss)
-
-        _highlight_paragraph(paragraph)
-
-        comment_lines: List[str] = []
-        for iss in matched:
-            comment_lines.append(
-                f"{issue_heading(iss)}\n"
-                f"Source Material: {issue_sources_text(iss)}\n"
-                f"Evidence: {iss.evidence}\n"
-                f"Recommendation: {iss.recommendation}"
-            )
-
-        _add_word_comment(
-            doc, paragraph,
-            "\n\n".join(comment_lines),
-            author="QA Reviewer",
-            comment_id=comment_id,
+def evaluate_single_segment(
+    segment:        XliffSegment,
+    instructions:   str,
+    mosaiq_context: str,
+    matched_mosaiq: Optional[MosaiqIssue],
+    api_key:        str,
+    model:          str,
+    temperature:    float,
+) -> EvaluatedSegment:
+    prompt = _build_segment_prompt(segment, instructions, mosaiq_context)
+    client = Anthropic(api_key=api_key)
+    try:
+        msg = client.messages.create(
+            model=model,
+            max_tokens=512,
+            temperature=temperature,
+            system=_EVAL_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
         )
-        comment_id += 1
+        text_blocks = [
+            getattr(item, "text", "")
+            for item in msg.content
+            if getattr(item, "type", "") == "text"
+        ]
+        raw  = "\n".join(text_blocks)
+        data = safe_json_loads(raw) or {}
 
-    # ── attach unmatched issues to the first non-empty paragraph ─────────────
-    if unmatched:
-        first_para = next(
-            (p for p in doc.paragraphs if p.text.strip()), None
+        return EvaluatedSegment(
+            segment           = segment,
+            has_issue         = bool(data.get("has_issue",         False)),
+            is_false_positive = bool(data.get("is_false_positive", False)),
+            ai_confidence     = float(data.get("ai_confidence",    0.5)),
+            ai_issue          = str(data.get("ai_issue",           "None")),
+            ai_comment        = str(data.get("ai_comment",         "No comment.")),
+            ai_rationale      = str(data.get("ai_rationale",       "No rationale.")),
+            matched_mosaiq    = matched_mosaiq,
         )
-        if first_para:
-            _highlight_paragraph(first_para)
-            comment_lines = ["[UNMATCHED ISSUES — could not be located in text]\n"]
-            for iss in unmatched:
-                comment_lines.append(
-                    f"{issue_heading(iss)}\n"
-                    f"Source Material: {issue_sources_text(iss)}\n"
-                    f"Evidence: {iss.evidence}\n"
-                    f"Recommendation: {iss.recommendation}"
+    except Exception as exc:
+        return EvaluatedSegment(
+            segment           = segment,
+            has_issue         = False,
+            is_false_positive = False,
+            ai_confidence     = 0.0,
+            ai_issue          = "Evaluation error",
+            ai_comment        = f"Evaluation failed: {exc}",
+            ai_rationale      = f"API call failed: {exc}",
+            matched_mosaiq    = matched_mosaiq,
+        )
+
+
+def evaluate_segments_parallel(
+    segments:       List[XliffSegment],
+    instructions:   str,
+    mosaiq_context: str,
+    seg_to_mosaiq:  Dict[str, MosaiqIssue],
+    api_key:        str,
+    model:          str,
+    temperature:    float,
+    max_workers:    int = MAX_WORKERS,
+    progress_cb     = None,
+) -> List[EvaluatedSegment]:
+    results: List[Optional[EvaluatedSegment]] = [None] * len(segments)
+    total   = len(segments)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {
+            executor.submit(
+                evaluate_single_segment,
+                seg,
+                instructions,
+                mosaiq_context,
+                seg_to_mosaiq.get(seg.seg_id),
+                api_key,
+                model,
+                temperature,
+            ): idx
+            for idx, seg in enumerate(segments)
+        }
+
+        done = 0
+        for future in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                results[idx] = EvaluatedSegment(
+                    segment           = segments[idx],
+                    has_issue         = False,
+                    is_false_positive = False,
+                    ai_confidence     = 0.0,
+                    ai_issue          = "Worker error",
+                    ai_comment        = f"Worker error: {exc}",
+                    ai_rationale      = f"Worker error: {exc}",
                 )
-            _add_word_comment(
-                doc, first_para,
-                "\n\n".join(comment_lines),
-                author="QA Reviewer",
-                comment_id=comment_id,
-            )
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
+
+    return [r for r in results if r is not None]
+
+
+def build_seg_to_mosaiq(
+    segments: List[XliffSegment],
+    issues:   List[MosaiqIssue],
+) -> Dict[str, MosaiqIssue]:
+    by_id:  Dict[str, MosaiqIssue] = {
+        iss.seg_id: iss for iss in issues if iss.seg_id
+    }
+    by_src: Dict[str, MosaiqIssue] = {}
+    for iss in issues:
+        key = iss.source_text[:80].strip().lower()
+        if key:
+            by_src[key] = iss
+
+    result: Dict[str, MosaiqIssue] = {}
+    for seg in segments:
+        if seg.seg_id in by_id:
+            result[seg.seg_id] = by_id[seg.seg_id]
+        else:
+            key = seg.source[:80].strip().lower()
+            if key in by_src:
+                result[seg.seg_id] = by_src[key]
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Excel Report Writer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_HDR_FILL     = PatternFill("solid", fgColor="1F6B3A")
+_HDR_FONT     = Font(bold=True, color="FFFFFF", name="Segoe UI", size=9)
+_WRAP_ALIGN   = Alignment(wrap_text=True, vertical="top")
+_REAL_FILL    = PatternFill("solid", fgColor="FFCCCC")
+_FP_FILL      = PatternFill("solid", fgColor="FFFFFF")
+_LOWCONF_FILL = PatternFill("solid", fgColor="FFF3CC")
+_CLEAN_FILL   = PatternFill("solid", fgColor="E8F5E9")
+_PLAIN_FILL   = PatternFill("solid", fgColor="FFFFFF")
+_BODY_FONT    = Font(name="Segoe UI", size=9, color="1e1f2e")
+
+_SPEC_HEADERS = [
+    "Doc-ID", "Seg-Seq", "Seg-ID", "Seg-Info",
+    "Source", "Target",
+    "FP", "Comment", "Issue Sign", "Issue Group",
+]
+_AI_HEADERS = [
+    "AI Issue",       # K
+    "AI Confidence",  # L  — numeric 0.000–1.000
+    "AI Comment",     # M
+    "AI Rationale",   # N
+]
+_ALL_HEADERS = _SPEC_HEADERS + _AI_HEADERS
+
+
+def _style_header_row(ws, col_count: int) -> None:
+    for col in range(1, col_count + 1):
+        cell           = ws.cell(row=1, column=col)
+        cell.fill      = _HDR_FILL
+        cell.font      = _HDR_FONT
+        cell.alignment = _WRAP_ALIGN
+
+
+def _auto_col_width(ws, min_w: int = 10, max_w: int = 60) -> None:
+    for col_cells in ws.columns:
+        length     = max(len(str(c.value or "")) for c in col_cells)
+        col_letter = get_column_letter(col_cells[0].column)
+        ws.column_dimensions[col_letter].width = max(min_w, min(length + 2, max_w))
+
+
+def _append_row(ws, values: list, fill: PatternFill) -> None:
+    ws.append(values)
+    row_idx = ws.max_row
+    for col_idx in range(1, len(values) + 1):
+        cell           = ws.cell(row=row_idx, column=col_idx)
+        cell.fill      = fill
+        cell.font      = _BODY_FONT
+        cell.alignment = _WRAP_ALIGN
+
+
+def _build_row(result: EvaluatedSegment) -> list:
+    seg = result.segment
+    mq  = result.matched_mosaiq
+
+    if result.is_false_positive:
+        fp_val = "Yes"
+    elif result.has_issue:
+        fp_val = "No"
+    else:
+        fp_val = ""
+
+    ai_comment = result.ai_comment
+    if result.is_false_positive and result.ai_confidence < FP_CONFIDENCE_THRESHOLD:
+        ai_comment = (
+            f"[LOW CONFIDENCE – HUMAN REVIEW REQUIRED "
+            f"(score={result.ai_confidence:.2f})] {ai_comment}"
+        )
+
+    return [
+        seg.doc_id,
+        seg.seg_seq,
+        seg.seg_id,
+        seg.state,
+        seg.source,
+        seg.target,
+        fp_val,
+        mq.comment     if mq else "",
+        mq.issue_sign  if mq else "",
+        mq.issue_group if mq else "",
+        result.ai_issue,
+        round(result.ai_confidence, 3),
+        ai_comment,
+        result.ai_rationale,
+    ]
+
+
+def _pick_fill(result: EvaluatedSegment) -> PatternFill:
+    if result.has_issue:
+        return _REAL_FILL
+    if result.is_false_positive:
+        return _FP_FILL if result.ai_confidence >= FP_CONFIDENCE_THRESHOLD else _LOWCONF_FILL
+    return _CLEAN_FILL
+
+
+def write_metric_report(
+    out_path:    Path,
+    results:     List[EvaluatedSegment],
+    total_words: int = 0,
+) -> Tuple[int, int, int]:
+    """
+    Sheet layout:
+      QA_Report  — real errors only          (red rows)
+      Exclusions — all non-errors:
+                     high-conf FP → white
+                     low-conf FP  → yellow
+                     clean segs   → green
+      All_Issues — every segment
+      Cost       — word count / cost estimate
+
+    QA_Report count + Exclusions count == len(results)  always.
+    """
+    wb = Workbook()
+
+    # ── classify ──────────────────────────────────────────────────────────────
+    qa_rows:   List[EvaluatedSegment] = []   # real errors
+    excl_rows: List[EvaluatedSegment] = []   # everything that is NOT a real error
+
+    for r in results:
+        if r.has_issue:
+            qa_rows.append(r)
+        else:
+            excl_rows.append(r)   # confirmed FP, low-conf FP, and clean all go here
+
+    # ── Sheet 1 : QA_Report  (real errors only) ───────────────────────────────
+    ws_qa       = wb.active
+    ws_qa.title = "QA_Report"
+    ws_qa.append(_ALL_HEADERS)
+    _style_header_row(ws_qa, len(_ALL_HEADERS))
+    for r in qa_rows:
+        _append_row(ws_qa, _build_row(r), _REAL_FILL)
+    _auto_col_width(ws_qa)
+
+    # ── Sheet 2 : Exclusions  (all non-errors) ────────────────────────────────
+    ws_excl = wb.create_sheet("Exclusions")
+    ws_excl.append(_ALL_HEADERS)
+    _style_header_row(ws_excl, len(_ALL_HEADERS))
+    for r in excl_rows:
+        # high-confidence FP  → white
+        # low-confidence FP   → yellow  (needs human review)
+        # clean (no issue)    → green
+        if r.is_false_positive and r.ai_confidence < FP_CONFIDENCE_THRESHOLD:
+            fill = _LOWCONF_FILL   # yellow
+        elif r.is_false_positive:
+            fill = _FP_FILL        # white
+        else:
+            fill = _CLEAN_FILL     # green
+        _append_row(ws_excl, _build_row(r), fill)
+    _auto_col_width(ws_excl)
+
+    # ── Sheet 3 : All_Issues  (every segment, same colours) ───────────────────
+    ws_all = wb.create_sheet("All_Issues")
+    ws_all.append(_ALL_HEADERS)
+    _style_header_row(ws_all, len(_ALL_HEADERS))
+    for r in results:
+        _append_row(ws_all, _build_row(r), _pick_fill(r))
+    _auto_col_width(ws_all)
+
+    # ── Sheet 4 : Cost ────────────────────────────────────────────────────────
+    ws_cost = wb.create_sheet("Cost")
+    ws_cost.append(["Total Words", "Rate USD/Word", "Estimated Cost USD"])
+    _style_header_row(ws_cost, 3)
+    _append_row(
+        ws_cost,
+        [total_words, WORD_COST_USD, round(total_words * WORD_COST_USD, 4)],
+        _PLAIN_FILL,
+    )
+    _auto_col_width(ws_cost)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(out_path))
+    wb.save(str(out_path))
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Report helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def save_summary_docx(path: Path, assessments: List[ArticleAssessment]) -> None:
-    doc = Document()
-    doc.add_heading("QA Issues Summary", level=1)
-    for a in assessments:
-        doc.add_heading(a.article, level=2)
-        doc.add_paragraph(f"Summary: {a.summary}")
-        doc.add_paragraph(f"Readiness Score: {a.readiness_score}")
-        if a.issues:
-            doc.add_paragraph("Issues:")
-            for idx, iss in enumerate(a.issues, 1):
-                doc.add_paragraph(
-                    f"  {idx}. {issue_heading(iss)}\n"
-                    f"     Source Material: {issue_sources_text(iss)}\n"
-                    f"     Evidence: {iss.evidence}\n"
-                    f"     Recommendation: {iss.recommendation}",
-                    style="List Bullet",
-                )
-        doc.add_paragraph("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(path))
-
-
-def write_sheet(ws, rows: List[dict], headers: List[str]) -> None:
-    ws.append(headers)
-    for row in rows:
-        ws.append([row.get(h, "") for h in headers])
-
-
-def build_excel_report(
-    path: Path,
-    assessments: List[ArticleAssessment],
-    word_counts: List[dict],
-) -> None:
-    rows = []
-    for a in assessments:
-        high = len([i for i in a.issues if i.severity.lower() == "high"])
-        med  = len([i for i in a.issues if i.severity.lower() == "medium"])
-        low  = len([i for i in a.issues if i.severity.lower() == "low"])
-        rows.append({
-            "Article":       a.article,
-            "Summary":       a.summary,
-            "ReadinessScore":a.readiness_score,
-            "HighIssues":    high,
-            "MediumIssues":  med,
-            "LowIssues":     low,
-            "TotalIssues":   len(a.issues),
-        })
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    wb    = Workbook()
-    ws_qa = wb.active
-    ws_qa.title = "QA_Readiness"
-    write_sheet(ws_qa, rows,
-                ["Article", "Summary", "ReadinessScore",
-                 "HighIssues", "MediumIssues", "LowIssues", "TotalIssues"])
-
-    scores  = [float(r.get("ReadinessScore", 0) or 0) for r in rows]
-    overall = (sum(scores) / len(scores)) if scores else 0.0
-    ws_overall = wb.create_sheet("Overall")
-    write_sheet(ws_overall, [{"OverallReadinessScore": overall}], ["OverallReadinessScore"])
-
-    ws_wc = wb.create_sheet("WordCount")
-    write_sheet(ws_wc, word_counts, ["File", "Category", "WordCount"])
-
-    total_words = sum(int(r.get("WordCount", 0) or 0) for r in word_counts)
-    ws_cost = wb.create_sheet("CostEstimate")
-    write_sheet(
-        ws_cost,
-        [{
-            "TotalWords":        total_words,
-            "RateUSDPerWord":    WORD_COST_USD,
-            "EstimatedCostUSD":  round(total_words * WORD_COST_USD, 2),
-        }],
-        ["TotalWords", "RateUSDPerWord", "EstimatedCostUSD"],
-    )
-    wb.save(path)
+    return len(qa_rows), len(excl_rows), 0   # third value kept for signature compat
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -788,16 +903,12 @@ def build_excel_report(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class FlatButton:
-    """
-    Flat rounded button — pure composition (no Tkinter subclassing).
-    Pack/grid the instance directly; .pack()/.grid()/.place() delegate
-    to the internal Canvas widget.
-    """
-
-    def __init__(self, parent, text="", command=None,
-                 bg=ACCENT, hover_bg=ACCENT_HOVER,
-                 fg=TEXT_PRIMARY, font=("Segoe UI", 9, "bold"),
-                 width=130, height=32, radius=8):
+    def __init__(
+        self, parent, text="", command=None,
+        bg=ACCENT, hover_bg=ACCENT_HOVER,
+        fg=TEXT_PRIMARY, font=("Segoe UI", 9, "bold"),
+        width=130, height=32, radius=8,
+    ):
         try:
             parent_bg = parent.cget("bg")
         except Exception:
@@ -814,68 +925,47 @@ class FlatButton:
         self._h       = height
 
         self.widget = tk.Canvas(
-            parent,
-            width=width, height=height,
-            bg=parent_bg,
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2",
+            parent, width=width, height=height,
+            bg=parent_bg, highlightthickness=0, bd=0, cursor="hand2",
         )
-
-        # Defer first draw until the canvas is fully registered in Tcl/Tk
         self.widget.after(0, lambda: self._draw(self._bg))
-
         self.widget.bind("<Enter>",    lambda _: self._draw(self._hbg))
         self.widget.bind("<Leave>",    lambda _: self._draw(self._bg))
         self.widget.bind("<Button-1>", lambda _: self._on_click())
 
-    # ── geometry / config shims ───────────────────────────────────────────────
-    def pack(self, **kwargs):   self.widget.pack(**kwargs)
-    def grid(self, **kwargs):   self.widget.grid(**kwargs)
-    def place(self, **kwargs):  self.widget.place(**kwargs)
-    def config(self, **kwargs): self.widget.config(**kwargs)
+    def pack(self, **kw):   self.widget.pack(**kw)
+    def grid(self, **kw):   self.widget.grid(**kw)
+    def place(self, **kw):  self.widget.place(**kw)
+    def config(self, **kw): self.widget.config(**kw)
 
-    # ── drawing ───────────────────────────────────────────────────────────────
     def _round_rect(self, x1, y1, x2, y2, r, **kw):
         pts = [
-            x1+r, y1,    x2-r, y1,
-            x2,   y1,    x2,   y1+r,
-            x2,   y2-r,  x2,   y2,
-            x2-r, y2,    x1+r, y2,
-            x1,   y2,    x1,   y2-r,
-            x1,   y1+r,  x1,   y1,
+            x1+r, y1,   x2-r, y1,   x2,   y1,
+            x2,   y1+r, x2,   y2-r, x2,   y2,
+            x2-r, y2,   x1+r, y2,   x1,   y2,
+            x1,   y2-r, x1,   y1+r, x1,   y1,
             x1+r, y1,
         ]
         return self.widget.create_polygon(pts, smooth=True, **kw)
 
-    def _draw(self, color):
+    def _draw(self, color: str) -> None:
         self.widget.delete("all")
-        self._round_rect(0, 0, self._w, self._h, self._radius,
-                         fill=color, outline="")
+        self._round_rect(0, 0, self._w, self._h, self._radius, fill=color, outline="")
         self.widget.create_text(
             self._w // 2, self._h // 2,
-            text=self._text,
-            fill=self._fg,
-            font=self._font,
-            anchor="center",
+            text=self._text, fill=self._fg,
+            font=self._font, anchor="center",
         )
 
-    def _on_click(self):
+    def _on_click(self) -> None:
         self._draw(self._bg)
         if self._command:
             self._command()
 
 
 class PathRow(tk.Frame):
-    """
-    Self-contained path-picker row.
-    - Remembers the last used directory per-row across sessions via a small JSON cache
-    - Falls back to the last globally used directory from any other row
-    - Updates initdir live as the user types or pastes a path
-    """
-
-    _STATE_FILE = Path.home() / ".qa_reviewer_dirs.json"
-    _state: dict = {}          # loaded once at class level
+    _STATE_FILE:   Path = Path.home() / ".qa_reviewer_dirs.json"
+    _state:        dict = {}
     _state_loaded: bool = False
 
     @classmethod
@@ -885,12 +975,8 @@ class PathRow(tk.Frame):
         cls._state_loaded = True
         try:
             if cls._STATE_FILE.exists():
-                raw = json.loads(cls._STATE_FILE.read_text(encoding="utf-8"))
-                # Only keep entries that still exist on disk
-                cls._state = {
-                    k: v for k, v in raw.items()
-                    if Path(v).exists()
-                }
+                raw        = json.loads(cls._STATE_FILE.read_text(encoding="utf-8"))
+                cls._state = {k: v for k, v in raw.items() if Path(v).exists()}
         except Exception:
             cls._state = {}
 
@@ -906,7 +992,6 @@ class PathRow(tk.Frame):
 
     @classmethod
     def _get_global_last(cls) -> str:
-        """Most recently used directory across ALL rows."""
         return cls._state.get("__last_global__", "")
 
     @classmethod
@@ -914,45 +999,39 @@ class PathRow(tk.Frame):
         cls._state["__last_global__"] = directory
         cls._save_state()
 
-    def __init__(self, parent, label: str, icon: str,
-                 pick_mode: str = "folder",
-                 file_types=None,
-                 row_key: str = "",
-                 **kwargs):
+    def __init__(
+        self, parent, label: str, icon: str,
+        pick_mode:  str = "folder",
+        file_types      = None,
+        row_key:    str = "",
+        **kwargs,
+    ):
         super().__init__(parent, bg=BG_CARD, **kwargs)
-
         PathRow._load_state()
 
         self._mode      = pick_mode
         self._filetypes = file_types or [("All", "*.*")]
-        # row_key lets each row remember its OWN last directory independently
         self._row_key   = row_key or label
         self._initdir   = self._resolve_initdir()
 
-        # ── icon + label ──────────────────────────────────────────────────────
         lbl_frame = tk.Frame(self, bg=BG_CARD)
         lbl_frame.pack(fill=tk.X, padx=12, pady=(10, 2))
-
         tk.Label(lbl_frame, text=icon, bg=BG_CARD,
                  fg=ACCENT, font=("Segoe UI", 11)).pack(side=tk.LEFT)
         tk.Label(lbl_frame, text=f"  {label}", bg=BG_CARD,
-                 fg=TEXT_SECONDARY,
-                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+                 fg=TEXT_SECONDARY, font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
 
-        # ── entry + button row ────────────────────────────────────────────────
         row = tk.Frame(self, bg=BG_CARD)
         row.pack(fill=tk.X, padx=12, pady=(0, 10))
 
         entry_wrap = tk.Frame(row, bg=BORDER, bd=0)
         entry_wrap.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
         inner = tk.Frame(entry_wrap, bg=BG_INPUT, bd=0)
         inner.pack(fill=tk.BOTH, padx=1, pady=1)
 
         self.var    = tk.StringVar()
         self._entry = tk.Entry(
-            inner,
-            textvariable=self.var,
+            inner, textvariable=self.var,
             bg=BG_INPUT, fg=TEXT_PRIMARY,
             insertbackground=TEXT_PRIMARY,
             relief=tk.FLAT, bd=6,
@@ -961,96 +1040,61 @@ class PathRow(tk.Frame):
             disabledforeground=TEXT_SECONDARY,
         )
         self._entry.pack(fill=tk.X)
-
-        self._entry.bind("<FocusIn>",
-                         lambda _: entry_wrap.config(bg=ACCENT))
-        self._entry.bind("<FocusOut>",
-                         lambda _: entry_wrap.config(bg=BORDER))
-
-        # Update initdir live as the user types / pastes
+        self._entry.bind("<FocusIn>",  lambda _: entry_wrap.config(bg=ACCENT))
+        self._entry.bind("<FocusOut>", lambda _: entry_wrap.config(bg=BORDER))
         self.var.trace_add("write", self._on_entry_change)
 
         FlatButton(
-            row,
-            text="Browse",
+            row, text="Browse",
             bg=ACCENT_DIM, hover_bg=ACCENT,
-            width=90, height=30,
-            command=self._pick,
+            width=90, height=30, command=self._pick,
         ).pack(side=tk.LEFT)
 
-    # ── directory resolution ──────────────────────────────────────────────────
     def _resolve_initdir(self) -> str:
-        """
-        Priority order for the starting directory:
-        1. This row's own last-used directory (saved from a previous session)
-        2. The most recently used directory from any other row (same session or saved)
-        3. The user's Desktop
-        4. The user's Documents folder
-        5. Home directory
-        """
-        # 1. Row-specific saved dir
         row_saved = PathRow._state.get(self._row_key, "")
         if row_saved and Path(row_saved).exists():
             return row_saved
-
-        # 2. Global last used
         global_last = self._get_global_last()
         if global_last and Path(global_last).exists():
             return global_last
-
-        # 3. Desktop
         desktop = Path.home() / "Desktop"
         if desktop.exists():
             return str(desktop)
-
-        # 4. Documents (including OneDrive variants)
         for candidate in [
             Path.home() / "Documents",
             *sorted(Path.home().glob("OneDrive*/Documents")),
         ]:
             if candidate.exists():
                 return str(candidate)
-
-        # 5. Home
         return str(Path.home())
 
     def _remember(self, directory: str) -> None:
-        """Persist this directory for this row and update the global last."""
         if not directory or not Path(directory).exists():
             return
         PathRow._state[self._row_key] = directory
-        self._set_global_last(directory)   # also saves state
+        self._set_global_last(directory)
 
     def _on_entry_change(self, *_) -> None:
-        """Track valid paths typed or pasted into the entry."""
         typed = self.var.get().strip()
         if not typed:
             return
-        p = Path(typed)
-        # If it looks like a file path use the parent; otherwise use as-is
-        candidate = (
-            p.parent
-            if (p.is_file() or (not p.exists() and p.suffix))
-            else p
-        )
+        p         = Path(typed)
+        candidate = p.parent if (p.is_file() or (not p.exists() and p.suffix)) else p
         if candidate.exists():
             self._initdir = str(candidate)
 
-    # ── public ────────────────────────────────────────────────────────────────
     def get(self) -> str:
         return self.var.get().strip()
 
     def set(self, value: str) -> None:
         self.var.set(value)
         if value:
-            p       = Path(value)
-            new_dir = str(p.parent if p.is_file() else p)
+            p             = Path(value)
+            new_dir       = str(p.parent if p.is_file() else p)
             self._initdir = new_dir
             self._remember(new_dir)
 
-    # ── private ───────────────────────────────────────────────────────────────
     def _pick(self) -> None:
-        # Honour whatever the user has typed before opening the dialog
         current = self.var.get().strip()
         if current:
             p         = Path(current)
@@ -1060,16 +1104,14 @@ class PathRow(tk.Frame):
 
         if self._mode == "folder":
             selected = filedialog.askdirectory(
-                initialdir=self._initdir,
-                title=f"Select folder",
+                initialdir=self._initdir, title="Select folder"
             )
         else:
             selected = filedialog.askopenfilename(
                 initialdir=self._initdir,
                 filetypes=self._filetypes,
-                title=f"Select file",
+                title="Select file",
             )
-
         if selected:
             self.set(selected)
 
@@ -1078,22 +1120,23 @@ class StatusBar(tk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=BG_DARK, height=28, **kwargs)
         self.pack_propagate(False)
-
         self._dot = tk.Label(self, text="●", bg=BG_DARK,
                              fg=TEXT_MUTED, font=("Segoe UI", 10))
         self._dot.pack(side=tk.LEFT, padx=(12, 4))
-
         self._lbl = tk.Label(self, text="Ready", bg=BG_DARK,
                              fg=TEXT_SECONDARY, font=("Segoe UI", 8))
         self._lbl.pack(side=tk.LEFT)
-
         self._time_lbl = tk.Label(self, text="", bg=BG_DARK,
                                   fg=TEXT_MUTED, font=("Segoe UI", 8))
         self._time_lbl.pack(side=tk.RIGHT, padx=12)
 
     def set(self, text: str, state: str = "idle") -> None:
-        colours = {"idle": TEXT_MUTED, "running": WARNING,
-                   "ok": SUCCESS, "error": DANGER}
+        colours = {
+            "idle":    TEXT_MUTED,
+            "running": WARNING,
+            "ok":      SUCCESS,
+            "error":   DANGER,
+        }
         self._dot.config(fg=colours.get(state, TEXT_MUTED))
         self._lbl.config(
             text=text,
@@ -1102,76 +1145,650 @@ class StatusBar(tk.Frame):
         self._time_lbl.config(text=datetime.now().strftime("%H:%M:%S"))
 
 
-def list_available_gemini_models(api_key: str) -> List[str]:
-    """Return names of Gemini models that support generateContent."""
-    try:
-        client = genai.Client(api_key=api_key)
-        models = client.models.list()
-        return sorted([
-            m.name for m in models
-            if "generateContent" in (m.supported_actions or [])
-            and "gemini" in m.name.lower()
-        ])
-    except Exception as e:
-        return [f"Error listing models: {e}"]
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tab 1 — QA Reviewer shell (disabled)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Tab1Frame(tk.Frame):
+    def __init__(self, parent: tk.Widget, status_bar: StatusBar, **kwargs) -> None:
+        super().__init__(parent, bg=BG_DARK, **kwargs)
+        self._status_bar = status_bar
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        body = tk.Frame(self, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+
+        left = tk.Frame(body, bg=BG_DARK, width=440)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 8))
+        left.pack_propagate(False)
+
+        right = tk.Frame(body, bg=BG_DARK)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def section_label(p: tk.Frame, text: str) -> None:
+            f = tk.Frame(p, bg=BG_DARK)
+            f.pack(fill=tk.X, pady=(10, 4))
+            tk.Label(f, text=text, bg=BG_DARK, fg=ACCENT,
+                     font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+            tk.Frame(f, bg=BORDER, height=1).pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=6)
+
+        section_label(left, "INPUT FOLDERS")
+        PathRow(left, "Article Folder (.docx)",             "📄", row_key="t1_articles").pack(fill=tk.X, pady=2)
+        PathRow(left, "Reference Materials Folder (.docx)", "📚", row_key="t1_references").pack(fill=tk.X, pady=2)
+        PathRow(left, "Internal Spot Check Folder (.docx)", "🔍", row_key="t1_spotchecks").pack(fill=tk.X, pady=2)
+
+        section_label(left, "OUTPUT & CONFIGURATION")
+        PathRow(left, "Output Folder", "📁", row_key="t1_output").pack(fill=tk.X, pady=2)
+        PathRow(left, ".env File  (ANTHROPIC_API_KEY)", "🔑",
+                pick_mode="file",
+                file_types=[("ENV file", ".env"), ("All files", "*.*")],
+                row_key="t1_env").pack(fill=tk.X, pady=2)
+
+        btn_frame = tk.Frame(left, bg=BG_DARK)
+        btn_frame.pack(fill=tk.X, pady=(18, 4))
+        FlatButton(btn_frame, text="▶  Run QA Workflow",
+                   command=self._disabled_notice,
+                   bg=ACCENT_DIM, hover_bg=ACCENT_DIM,
+                   width=200, height=38,
+                   font=("Segoe UI", 10, "bold")).pack(side=tk.RIGHT)
+
+        section_label(left, "AGENT PIPELINE")
+        self._build_agent_cards(left)
+
+        log_header = tk.Frame(right, bg=BG_PANEL)
+        log_header.pack(fill=tk.X)
+        tk.Label(log_header, text="  ◈  Activity Log", bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, font=("Segoe UI", 9, "bold")).pack(
+            side=tk.LEFT, pady=8, padx=4)
+        tk.Frame(right, bg=BORDER, height=1).pack(fill=tk.X)
+
+        log_wrap = tk.Frame(right, bg=BG_INPUT)
+        log_wrap.pack(fill=tk.BOTH, expand=True)
+        self.log_box = tk.Text(log_wrap, bg=BG_INPUT, fg=TEXT_SECONDARY,
+                               font=("Consolas", 9), relief=tk.FLAT, bd=10,
+                               wrap=tk.WORD, state=tk.DISABLED)
+        self.log_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(log_wrap, orient=tk.VERTICAL, command=self.log_box.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_box.config(yscrollcommand=sb.set)
+        self.log_box.config(state=tk.NORMAL)
+        self.log_box.insert(
+            tk.END,
+            "Tab 1 — QA Reviewer\n\n"
+            "This tab's workflow is currently disabled.\n"
+            "Please use Tab 2 (METRIC SYSTEM) for active processing.\n",
+        )
+        self.log_box.config(state=tk.DISABLED)
+
+    def _disabled_notice(self) -> None:
+        messagebox.showinfo(
+            "Disabled",
+            "Tab 1 workflow is disabled in this build.\n"
+            "Please use the METRIC SYSTEM tab.",
+        )
+
+    def _build_agent_cards(self, parent: tk.Frame) -> None:
+        cards_frame = tk.Frame(parent, bg=BG_DARK)
+        cards_frame.pack(fill=tk.X, pady=2)
+        for title, model, color, icon, side_pad in [
+            ("Agent 1", "Claude Opus — Rules", "#c97bf7", "🧠", (0, 4)),
+            ("Agent 2", "Claude Haiku — QA",   "#c97bf7", "🧠", (4, 0)),
+        ]:
+            card  = tk.Frame(cards_frame, bg=BG_CARD)
+            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=side_pad)
+            strip = tk.Frame(card, bg=color, width=3)
+            strip.pack(side=tk.LEFT, fill=tk.Y)
+            strip.pack_propagate(False)
+            inner = tk.Frame(card, bg=BG_CARD, padx=10, pady=8)
+            inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            tk.Label(inner, text=f"{icon} {title}", bg=BG_CARD,
+                     fg=color, font=("Segoe UI", 8, "bold")).pack(anchor="w")
+            tk.Label(inner, text=model, bg=BG_CARD,
+                     fg=TEXT_SECONDARY, font=("Segoe UI", 8)).pack(anchor="w")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Tab 2 — METRIC SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Tab2Frame(tk.Frame):
+    def __init__(self, parent: tk.Widget, status_bar: StatusBar, **kwargs) -> None:
+        super().__init__(parent, bg=BG_DARK, **kwargs)
+        self._status_bar  = status_bar
+        self._total_files = 1
+        self._build_ui()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build_ui(self) -> None:
+        body = tk.Frame(self, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+
+        left = tk.Frame(body, bg=BG_DARK, width=460)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 8))
+        left.pack_propagate(False)
+
+        right = tk.Frame(body, bg=BG_DARK)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def section_label(p: tk.Frame, text: str) -> None:
+            f = tk.Frame(p, bg=BG_DARK)
+            f.pack(fill=tk.X, pady=(10, 4))
+            tk.Label(f, text=text, bg=BG_DARK, fg=ACCENT,
+                     font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+            tk.Frame(f, bg=BORDER, height=1).pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=6)
+
+        section_label(left, "INPUT FILES")
+
+        self.row_xliff = PathRow(
+            left, "XLIFF File  (SDL XLIFF / XLIFF 1.2 / MXLIFF)", "🌐",
+            pick_mode="file",
+            file_types=[
+                ("XLIFF files", "*.sdlxliff *.xliff *.mxliff *.xlf"),
+                ("All files",   "*.*"),
+            ],
+            row_key="t2_xliff",
+        )
+        self.row_xliff.pack(fill=tk.X, pady=2)
+
+        self.row_xliff_folder = PathRow(
+            left, "— OR — SDL XLIFF Folder  (batch, *.sdlxliff)", "📂",
+            pick_mode="folder",
+            row_key="t2_xliff_folder",
+        )
+        self.row_xliff_folder.pack(fill=tk.X, pady=2)
+
+        tk.Label(
+            left,
+            text="  ⓘ  Single file takes priority.  Folder mode → one Excel per SDL XLIFF file.",
+            bg=BG_DARK, fg=TEXT_MUTED, font=("Segoe UI", 7),
+        ).pack(anchor="w", padx=14, pady=(0, 4))
+
+        self.row_instructions = PathRow(
+            left, "Client / Project Instructions  (.docx)", "📋",
+            pick_mode="file",
+            file_types=[("Word documents", "*.docx"), ("All files", "*.*")],
+            row_key="t2_instructions",
+        )
+        self.row_instructions.pack(fill=tk.X, pady=2)
+
+        self.row_report = PathRow(
+            left, "MosAIQ QA Report  (.xlsx)  — context only", "📊",
+            pick_mode="file",
+            file_types=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")],
+            row_key="t2_report",
+        )
+        self.row_report.pack(fill=tk.X, pady=2)
+
+        section_label(left, "OUTPUT & CONFIGURATION")
+
+        self.row_output = PathRow(left, "Output Folder", "📁", row_key="t2_output")
+        self.row_output.pack(fill=tk.X, pady=2)
+        self.row_output.set(str(Path.cwd() / "output_metric"))
+
+        self.row_env = PathRow(
+            left, ".env File  (ANTHROPIC_API_KEY)", "🔑",
+            pick_mode="file",
+            file_types=[("ENV file", ".env"), ("All files", "*.*")],
+            row_key="t2_env",
+        )
+        self.row_env.pack(fill=tk.X, pady=2)
+
+        # colour legend
+        legend_frame = tk.Frame(left, bg=BG_DARK)
+        legend_frame.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(legend_frame, text="Row colours: ", bg=BG_DARK,
+                 fg=TEXT_MUTED, font=("Segoe UI", 7)).pack(side=tk.LEFT)
+        for colour, label in [
+            ("#FFCCCC", "Real error"),
+            ("#FFF3CC", "Low-conf FP"),
+            ("#FFFFFF", "Confirmed FP"),
+            ("#E8F5E9", "Clean"),
+        ]:
+            tk.Label(legend_frame, text="■", bg=BG_DARK,
+                     fg=colour, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(6, 0))
+            tk.Label(legend_frame, text=label, bg=BG_DARK,
+                     fg=TEXT_MUTED, font=("Segoe UI", 7)).pack(side=tk.LEFT)
+
+        # run button
+        btn_frame = tk.Frame(left, bg=BG_DARK)
+        btn_frame.pack(fill=tk.X, pady=(14, 4))
+        self._run_btn = FlatButton(
+            btn_frame, text="▶  Run Metric Filter",
+            command=self._run,
+            bg=ACCENT, hover_bg=ACCENT_HOVER,
+            width=210, height=38,
+            font=("Segoe UI", 10, "bold"),
+        )
+        self._run_btn.pack(side=tk.RIGHT)
+
+        section_label(left, "AGENT PIPELINE")
+        self._build_agent_cards(left)
+
+        # stats strip
+        self._stats_frame = tk.Frame(left, bg=BG_CARD)
+        self._stats_frame.pack(fill=tk.X, pady=(8, 0))
+        self._lbl_total = self._stat_label(self._stats_frame, "Segments", "—")
+        self._lbl_real  = self._stat_label(self._stats_frame, "Errors",   "—")
+        self._lbl_excl  = self._stat_label(self._stats_frame, "FP Excl.", "—")
+        self._lbl_clean = self._stat_label(self._stats_frame, "Clean",    "—")
+
+        # progress bar
+        prog_frame = tk.Frame(left, bg=BG_DARK)
+        prog_frame.pack(fill=tk.X, pady=(4, 0))
+        style = ttk.Style()
+        style.configure(
+            "M2.Horizontal.TProgressbar",
+            troughcolor=BG_PANEL, background=ACCENT,
+            bordercolor=BG_PANEL, lightcolor=ACCENT, darkcolor=ACCENT,
+        )
+        self._progress = ttk.Progressbar(
+            prog_frame, style="M2.Horizontal.TProgressbar",
+            orient=tk.HORIZONTAL, mode="determinate", length=200,
+        )
+        self._progress.pack(fill=tk.X, pady=2)
+        self._progress_lbl = tk.Label(prog_frame, text="", bg=BG_DARK,
+                                       fg=TEXT_MUTED, font=("Segoe UI", 7))
+        self._progress_lbl.pack(anchor="e", padx=2)
+
+        # log panel
+        log_header = tk.Frame(right, bg=BG_PANEL)
+        log_header.pack(fill=tk.X)
+        tk.Label(log_header, text="  ◈  Activity Log", bg=BG_PANEL,
+                 fg=TEXT_PRIMARY, font=("Segoe UI", 9, "bold")).pack(
+            side=tk.LEFT, pady=8, padx=4)
+
+        clear_btn = tk.Label(log_header, text="Clear  ✕", bg=BG_PANEL,
+                             fg=TEXT_MUTED, font=("Segoe UI", 8), cursor="hand2")
+        clear_btn.pack(side=tk.RIGHT, padx=10)
+        clear_btn.bind("<Button-1>", lambda _: self._clear_log())
+        clear_btn.bind("<Enter>",    lambda _: clear_btn.config(fg=TEXT_PRIMARY))
+        clear_btn.bind("<Leave>",    lambda _: clear_btn.config(fg=TEXT_MUTED))
+
+        tk.Frame(right, bg=BORDER, height=1).pack(fill=tk.X)
+
+        log_wrap = tk.Frame(right, bg=BG_INPUT)
+        log_wrap.pack(fill=tk.BOTH, expand=True)
+        self.log_box = tk.Text(
+            log_wrap, bg=BG_INPUT, fg=TEXT_PRIMARY,
+            insertbackground=TEXT_PRIMARY,
+            font=("Consolas", 9), relief=tk.FLAT, bd=10,
+            wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground=ACCENT_DIM,
+        )
+        self.log_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.log_box.tag_config("time",    foreground=TEXT_MUTED)
+        self.log_box.tag_config("info",    foreground=TEXT_PRIMARY)
+        self.log_box.tag_config("success", foreground=SUCCESS)
+        self.log_box.tag_config("warning", foreground=WARNING)
+        self.log_box.tag_config("error",   foreground=DANGER)
+        self.log_box.tag_config("agent",   foreground="#c97bf7")
+        self.log_box.tag_config("dim",     foreground=TEXT_MUTED)
+
+        sb = ttk.Scrollbar(log_wrap, orient=tk.VERTICAL, command=self.log_box.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_box.config(yscrollcommand=sb.set)
+
+    # ── progress callback factory (never nested inside try) ───────────────────
+    def _make_progress_cb(self, file_idx: int, total_files: int):
+        file_offset = (file_idx - 1) / max(total_files, 1)
+        file_share  = 1.0 / max(total_files, 1)
+
+        def _cb(done: int, total: int) -> None:
+            if total == 0:
+                return
+            pct = int((file_offset + file_share * done / total) * 100)
+            self.after(
+                0,
+                lambda p=pct, d=done, t=total: self._set_progress_abs(p, d, t),
+            )
+
+        return _cb
+
+    # ── core workflow ─────────────────────────────────────────────────────────
+    def _run_inner(self) -> None:
+        try:
+            self._status_bar.set("Metric System — running…", "running")
+            self._progress["value"] = 0
+            self._progress_lbl.config(text="")
+
+            xliff_single = self.row_xliff.get()
+            xliff_folder = self.row_xliff_folder.get()
+            inst_path    = Path(self.row_instructions.get())
+            report_path  = Path(self.row_report.get())
+            out_dir      = Path(self.row_output.get())
+            env_file     = Path(self.row_env.get())
+
+            # ── validate inputs ───────────────────────────────────────────────
+            errors: List[str] = []
+            if not xliff_single and not xliff_folder:
+                errors.append(
+                    "Provide either a single XLIFF file or "
+                    "a folder of SDL XLIFF files."
+                )
+            if xliff_single and not Path(xliff_single).exists():
+                errors.append(f"XLIFF file not found: {xliff_single}")
+            if xliff_folder and not Path(xliff_folder).is_dir():
+                errors.append(f"XLIFF folder not found: {xliff_folder}")
+            if not inst_path.exists():
+                errors.append("Instructions file not found.")
+            if not report_path.exists():
+                errors.append("MosAIQ report not found.")
+            if not env_file.exists():
+                errors.append(".env file not found.")
+            if errors:
+                raise ValueError("\n".join(errors))
+
+            env           = load_env_file(env_file)
+            anthropic_key = env.get("ANTHROPIC_API_KEY", "")
+            if not anthropic_key:
+                raise ValueError("ANTHROPIC_API_KEY not found in .env file.")
+
+            agent_cfg   = load_agent_settings(DEFAULT_MOSAIQ_CONFIG)
+            model       = agent_cfg.get("step2_model", DEFAULT_CLAUDE_MODEL_AGENT2)
+            temperature = float(agent_cfg.get("step2_temp", 0.2))
+
+            out_dir.mkdir(parents=True, exist_ok=True)
+            json_dir = out_dir / "json_cache"
+            json_dir.mkdir(parents=True, exist_ok=True)
+
+            # ── collect XLIFF paths ───────────────────────────────────────────
+            if xliff_single:
+                xliff_paths = [Path(xliff_single)]
+                self._log(f"Single XLIFF mode → {Path(xliff_single).name}")
+            else:
+                folder      = Path(xliff_folder)
+                xliff_paths = sorted(folder.rglob("*.sdlxliff"))
+                if not xliff_paths:
+                    raise ValueError(f"No *.sdlxliff files found in:\n{folder}")
+                self._log(
+                    f"Folder mode → {len(xliff_paths)} SDL XLIFF file(s) "
+                    f"in {folder.name}"
+                )
+
+            self._total_files = len(xliff_paths)
+
+            # ── parse instructions (shared across all files) ──────────────────
+            self._log(f"Parsing instructions → {inst_path.name}")
+            instructions_text = parse_instructions_docx(inst_path)
+            inst_words        = word_count(instructions_text)
+            self._log(f"  {inst_words} words extracted")
+            save_json(
+                json_dir / "instructions.json",
+                instructions_to_json(instructions_text, inst_path.name),
+            )
+
+            # ── parse MosAIQ report for context (shared across all files) ─────
+            self._log(f"Reading MosAIQ context → {report_path.name}")
+            reader = MosaiqReportReader()
+            mosaiq_issues, _, header_row_idx = reader.read(report_path)
+            self._log(
+                f"  {len(mosaiq_issues)} MosAIQ reference row(s) "
+                f"(headers at row {header_row_idx + 1}) — context only"
+            )
+            mosaiq_context = _summarise_mosaiq_context(mosaiq_issues)
+
+            # ── grand totals across all files ─────────────────────────────────
+            ts              = datetime.now().strftime("%Y%m%d_%H%M%S")
+            grand_total     = 0
+            grand_errors    = 0
+            grand_excl      = 0
+            grand_low_conf  = 0
+            grand_clean     = 0
+
+            # ══════════════════════════════════════════════════════════════════
+            # Process every XLIFF file independently
+            # ══════════════════════════════════════════════════════════════════
+            for file_idx, xp in enumerate(xliff_paths, start=1):
+                self._log(
+                    f"─── File {file_idx}/{len(xliff_paths)}: {xp.name} ───",
+                    "agent",
+                )
+
+                # ── parse XLIFF → segments ────────────────────────────────────
+                parser   = XliffParser()
+                segments = parser.parse(xp)
+
+                if not segments:
+                    self._log(
+                        f"  No segments found — skipping {xp.name}", "warning"
+                    )
+                    continue
+
+                file_words = sum(word_count(s.source) for s in segments)
+                self._log(
+                    f"  {len(segments)} segment(s), {file_words} source words"
+                )
+                save_json(
+                    json_dir / f"{xp.stem}_segments.json",
+                    segments_to_json(segments),
+                )
+
+                # ── cross-reference segments with MosAIQ rows (best-effort) ───
+                seg_to_mosaiq = build_seg_to_mosaiq(segments, mosaiq_issues)
+                self._log(
+                    f"  Cross-referenced {len(seg_to_mosaiq)} / "
+                    f"{len(segments)} segments with MosAIQ rows"
+                )
+
+                # ── AI evaluation ─────────────────────────────────────────────
+                self._log(
+                    f"  Evaluating {len(segments)} segment(s) via Claude "
+                    f"[model={model}, workers={MAX_WORKERS}]…",
+                    "agent",
+                )
+
+                results = evaluate_segments_parallel(
+                    segments       = segments,
+                    instructions   = instructions_text,
+                    mosaiq_context = mosaiq_context,
+                    seg_to_mosaiq  = seg_to_mosaiq,
+                    api_key        = anthropic_key,
+                    model          = model,
+                    temperature    = temperature,
+                    max_workers    = MAX_WORKERS,
+                    progress_cb    = self._make_progress_cb(
+                        file_idx, len(xliff_paths)
+                    ),
+                )
+
+                # ── tally results ─────────────────────────────────────────────
+                # QA_Report  = real errors only
+                # Exclusions = everything else (confirmed FP + low-conf FP + clean)
+                # QA + Excl  = total   (always)
+                error_cnt    = sum(1 for r in results if r.has_issue)
+                excl_cnt     = len(results) - error_cnt
+                low_conf_cnt = sum(
+                    1 for r in results
+                    if r.is_false_positive
+                    and r.ai_confidence < FP_CONFIDENCE_THRESHOLD
+                )
+                clean_cnt    = sum(
+                    1 for r in results
+                    if not r.has_issue and not r.is_false_positive
+                )
+
+                self._log(
+                    f"  → QA_Report: {error_cnt}  |  "
+                    f"Exclusions: {excl_cnt} "
+                    f"({low_conf_cnt} low-conf FP yellow, "
+                    f"{clean_cnt} clean green)  |  "
+                    f"Total: {len(results)}",
+                    "success",
+                )
+
+                # sanity check
+                assert error_cnt + excl_cnt == len(results), (
+                    f"QA_Report ({error_cnt}) + Exclusions ({excl_cnt}) "
+                    f"!= Total ({len(results)})"
+                )
+
+                # ── write Excel named after the XLIFF stem ────────────────────
+                total_words = file_words + inst_words
+                write_metric_report(
+                    out_path    = out_dir / f"{xp.stem}.xlsx",
+                    results     = results,
+                    total_words = total_words,
+                )
+                self._log(f"  Saved → {xp.stem}.xlsx", "success")
+
+                # ── per-file JSON (uses standalone helpers — no open literals) ─
+                file_json = _build_file_json(
+                    ts           = ts,
+                    xp           = xp,
+                    inst_path    = inst_path,
+                    report_path  = report_path,
+                    model        = model,
+                    results      = results,
+                    error_cnt    = error_cnt,
+                    excl_cnt     = excl_cnt,
+                    low_conf_cnt = low_conf_cnt,
+                    clean_cnt    = clean_cnt,
+                    total_words  = total_words,
+                )
+                save_json(
+                    out_dir / f"{xp.stem}_results_{ts}.json",
+                    file_json,
+                )
+
+                # ── accumulate grand totals ────────────────────────────────────
+                grand_total    += len(results)
+                grand_errors   += error_cnt
+                grand_excl     += excl_cnt
+                grand_low_conf += low_conf_cnt
+                grand_clean    += clean_cnt
+
+            # ══════════════════════════════════════════════════════════════════
+            # All files done
+            # ══════════════════════════════════════════════════════════════════
+            self.after(
+                0,
+                lambda: self._update_stats(
+                    grand_total,
+                    grand_errors,
+                    grand_excl,
+                    grand_clean,
+                ),
+            )
+            self._set_progress_abs(100, grand_total, grand_total)
+            self._status_bar.set("Metric System — completed", "ok")
+
+            messagebox.showinfo(
+                "Done",
+                "\n".join([
+                    "Metric System filter complete.\n",
+                    f"Files processed        : {len(xliff_paths)}",
+                    f"Segments evaluated     : {grand_total}",
+                    f"───────────────────────────────────",
+                    f"QA_Report  (errors)    : {grand_errors}",
+                    f"Exclusions (non-errors): {grand_excl}",
+                    f"  of which low-conf FP : {grand_low_conf}  ← yellow",
+                    f"  of which clean       : {grand_clean}  ← green",
+                    f"───────────────────────────────────",
+                    f"QA + Excl = Total      : "
+                    f"{grand_errors + grand_excl} / {grand_total}",
+                    f"Confidence threshold   : {FP_CONFIDENCE_THRESHOLD:.2f}",
+                    f"\nOutput folder:\n{out_dir}",
+                ]),
+            )
+
+        except Exception as exc:
+            self._status_bar.set(f"Error: {exc}", "error")
+            self._log(f"Fatal error: {exc}", "error")
+            messagebox.showerror("Error", str(exc))
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _stat_label(self, parent: tk.Frame, label: str, value: str) -> tk.Label:
+        cell = tk.Frame(parent, bg=BG_CARD)
+        cell.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=6, pady=6)
+        tk.Label(cell, text=label, bg=BG_CARD,
+                 fg=TEXT_MUTED, font=("Segoe UI", 7)).pack()
+        lbl = tk.Label(cell, text=value, bg=BG_CARD,
+                       fg=TEXT_PRIMARY, font=("Segoe UI", 10, "bold"))
+        lbl.pack()
+        return lbl
+
+    def _update_stats(
+        self, total: int, errors: int, excl: int, clean: int
+    ) -> None:
+        self._lbl_total.config(text=str(total))
+        self._lbl_real.config(text=str(errors), fg=DANGER if errors else SUCCESS)
+        self._lbl_excl.config(text=str(excl),   fg=WARNING)
+        self._lbl_clean.config(text=str(clean),  fg=SUCCESS)
+
+    def _build_agent_cards(self, parent: tk.Frame) -> None:
+        cards_frame = tk.Frame(parent, bg=BG_DARK)
+        cards_frame.pack(fill=tk.X, pady=2)
+        for title, desc, color, icon, side_pad in [
+            ("Agent 1", "Claude — XLIFF Segment Analysis", "#c97bf7", "🧠", (0, 4)),
+            ("Agent 2", "Claude — FP / Error Evaluation",  "#c97bf7", "🧠", (4, 0)),
+        ]:
+            card  = tk.Frame(cards_frame, bg=BG_CARD)
+            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=side_pad)
+            strip = tk.Frame(card, bg=color, width=3)
+            strip.pack(side=tk.LEFT, fill=tk.Y)
+            strip.pack_propagate(False)
+            inner = tk.Frame(card, bg=BG_CARD, padx=10, pady=8)
+            inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            tk.Label(
+                inner, text=f"{icon} {title}",
+                bg=BG_CARD, fg=color,
+                font=("Segoe UI", 8, "bold"),
+            ).pack(anchor="w")
+            tk.Label(
+                inner, text=desc,
+                bg=BG_CARD, fg=TEXT_SECONDARY,
+                font=("Segoe UI", 8),
+            ).pack(anchor="w")
+
+    def _log(self, text: str, level: str = "info") -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if level == "info":
+            tl = text.lower()
+            if "error" in tl or "fail" in tl:
+                level = "error"
+            elif "agent" in tl or "claude" in tl:
+                level = "agent"
+            elif (
+                "complet" in tl or "finish" in tl
+                or "done" in tl or "saved" in tl
+            ):
+                level = "success"
+            elif "warning" in tl or "fallback" in tl or "skip" in tl:
+                level = "warning"
+
+        self.log_box.config(state=tk.NORMAL)
+        self.log_box.insert(tk.END, f"[{stamp}]  ", "time")
+        self.log_box.insert(tk.END, f"{text}\n", level)
+        self.log_box.see(tk.END)
+        self.log_box.config(state=tk.DISABLED)
+        self.update_idletasks()
+
+    def _clear_log(self) -> None:
+        self.log_box.config(state=tk.NORMAL)
+        self.log_box.delete("1.0", tk.END)
+        self.log_box.config(state=tk.DISABLED)
+
+    def _set_progress_abs(self, pct: int, done: int, total: int) -> None:
+        self._progress["value"] = max(0, min(100, pct))
+        self._progress_lbl.config(text=f"{done} / {total}  ({pct}%)")
+        self.update_idletasks()
+
+    def _set_progress(self, done: int, total: int) -> None:
+        if total:
+            self._set_progress_abs(int(done / total * 100), done, total)
+
+    def _run(self) -> None:
+        threading.Thread(target=self._run_inner, daemon=True).start()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Main Application
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class App(tk.Tk):
-    def _check_gemini_models(self) -> None:
-        env_file = Path(self.row_env.get())
-        if not env_file.exists():
-            messagebox.showerror("Error", "Please select a valid .env file first.")
-            return
-
-        env        = load_env_file(env_file)
-        google_key = env.get("GOOGLE_API_KEY", "")
-        if not google_key:
-            messagebox.showerror("Error", "GOOGLE_API_KEY not found in the .env file.")
-            return
-
-        self._log("Fetching available Gemini models for your API key…", "agent1")
-        self._status_bar.set("Fetching Gemini models…", "running")
-
-        def _fetch():
-            models = list_available_gemini_models(google_key)
-            self._log(f"Available Gemini models ({len(models)}):", "agent1")
-            for m in models:
-                self._log(f"  • {m}", "agent1")
-            self._status_bar.set("Model list complete", "ok")
-
-            # Pick the best available pro model and suggest it
-            preferred = [
-                "models/gemini-2.5-pro",
-                "models/gemini-2.5-flash",
-                "models/gemini-1.5-pro",
-                "models/gemini-1.5-flash",
-            ]
-            suggestion = next(
-                (p for p in preferred if any(m.startswith(p) for m in models)),
-                None,
-            )
-            if suggestion:
-                matched = next(m for m in models if m.startswith(suggestion))
-                self._log(
-                    f"Suggested model for your key → update DEFAULT_GEMINI_MODEL "
-                    f"to: \"{matched}\"",
-                    "success",
-                )
-                # Ask user if they want to use it for this session
-                use_it = messagebox.askyesno(
-                    "Model suggestion",
-                    f"Best available model for your API key:\n\n{matched}\n\n"
-                    f"Use this model for the current session?",
-                )
-                if use_it:
-                    global DEFAULT_GEMINI_MODEL
-                    DEFAULT_GEMINI_MODEL = matched
-                    self._log(f"Session model updated → {matched}", "success")
-
-        threading.Thread(target=_fetch, daemon=True).start()
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
@@ -1186,12 +1803,6 @@ class App(tk.Tk):
 
         self._build_ui()
 
-        default_env = first_existing_env(DEFAULT_ENV_CANDIDATES)
-        if default_env:
-            self.row_env.set(str(default_env))
-        self.row_output.set(str(Path.cwd() / "output"))
-
-    # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self) -> None:
 
         # ── header ────────────────────────────────────────────────────────────
@@ -1215,369 +1826,101 @@ class App(tk.Tk):
 
         tk.Frame(self, bg=ACCENT, height=2).pack(fill=tk.X)
 
-        # ── body ──────────────────────────────────────────────────────────────
-        body = tk.Frame(self, bg=BG_DARK)
-        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
-
-        left = tk.Frame(body, bg=BG_DARK, width=440)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 8))
-        left.pack_propagate(False)
-
-        right = tk.Frame(body, bg=BG_DARK)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # ── section label helper ──────────────────────────────────────────────
-        def section_label(parent, text):
-            f = tk.Frame(parent, bg=BG_DARK)
-            f.pack(fill=tk.X, pady=(10, 4))
-            tk.Label(f, text=text, bg=BG_DARK,
-                     fg=ACCENT, font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
-            tk.Frame(f, bg=BORDER, height=1).pack(
-                side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=6)
-
-        # ── input folder rows ─────────────────────────────────────────────────
-        section_label(left, "INPUT FOLDERS")
-
-        self.row_articles = PathRow(
-            left, "Article Folder (.docx)", "📄",
-            row_key="articles",
-        )
-        self.row_articles.pack(fill=tk.X, pady=2)
-
-        self.row_refs = PathRow(
-            left, "Reference Materials Folder (.docx)", "📚",
-            row_key="references",
-        )
-        self.row_refs.pack(fill=tk.X, pady=2)
-
-        self.row_spots = PathRow(
-            left, "Internal Spot Check Folder (.docx)", "🔍",
-            row_key="spotchecks",
-        )
-        self.row_spots.pack(fill=tk.X, pady=2)
-
-        self.row_output = PathRow(
-            left, "Output Folder", "📁",
-            row_key="output",
-        )
-        self.row_output.pack(fill=tk.X, pady=2)
-
-        self.row_env = PathRow(
-            left,
-            ".env File  (ANTHROPIC_API_KEY)", "🔑",
-            pick_mode="file",
-            file_types=[("ENV file", ".env"), ("All files", "*.*")],
-            row_key="env",
-        )
-        self.row_env.pack(fill=tk.X, pady=2)
-
-        # ── run button ────────────────────────────────────────────────────────
-        btn_frame = tk.Frame(left, bg=BG_DARK)
-        btn_frame.pack(fill=tk.X, pady=(18, 4))
-
-        self._run_btn = FlatButton(
-            btn_frame,
-            text="▶  Run QA Workflow",
-            command=self.run_workflow,
-            bg=ACCENT, hover_bg=ACCENT_HOVER,
-            width=200, height=38,
-            font=("Segoe UI", 10, "bold"),
-        )
-        self._run_btn.pack(side=tk.RIGHT)
-
-        # ── agent info cards ──────────────────────────────────────────────────
-        section_label(left, "AGENT PIPELINE")
-        self._build_agent_cards(left)
-
-        # ── log panel ─────────────────────────────────────────────────────────
-        log_header = tk.Frame(right, bg=BG_PANEL)
-        log_header.pack(fill=tk.X)
-
-        tk.Label(log_header, text="  ◈  Activity Log", bg=BG_PANEL,
-                 fg=TEXT_PRIMARY, font=("Segoe UI", 9, "bold")).pack(
-            side=tk.LEFT, pady=8, padx=4)
-
-        self._clear_btn = tk.Label(
-            log_header, text="Clear  ✕", bg=BG_PANEL,
-            fg=TEXT_MUTED, font=("Segoe UI", 8), cursor="hand2")
-        self._clear_btn.pack(side=tk.RIGHT, padx=10)
-        self._clear_btn.bind("<Button-1>", lambda _: self._clear_log())
-        self._clear_btn.bind("<Enter>", lambda _: self._clear_btn.config(fg=TEXT_PRIMARY))
-        self._clear_btn.bind("<Leave>", lambda _: self._clear_btn.config(fg=TEXT_MUTED))
-
-        tk.Frame(right, bg=BORDER, height=1).pack(fill=tk.X)
-
-        # Log takes all remaining vertical space
-        log_wrap = tk.Frame(right, bg=BG_INPUT)
-        log_wrap.pack(fill=tk.BOTH, expand=True)
-
-        self.log_box = tk.Text(
-            log_wrap,
-            bg=BG_INPUT, fg=TEXT_PRIMARY,
-            insertbackground=TEXT_PRIMARY,
-            font=("Consolas", 9),        # slightly larger font
-            relief=tk.FLAT, bd=10,
-            wrap=tk.WORD,
-            state=tk.DISABLED,
-            selectbackground=ACCENT_DIM,
-        )
-        self.log_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.log_box.tag_config("time",    foreground=TEXT_MUTED)
-        self.log_box.tag_config("info",    foreground=TEXT_PRIMARY)
-        self.log_box.tag_config("success", foreground=SUCCESS)
-        self.log_box.tag_config("warning", foreground=WARNING)
-        self.log_box.tag_config("error",   foreground=DANGER)
-        self.log_box.tag_config("agent1",  foreground="#c97bf7")
-        self.log_box.tag_config("agent2",  foreground="#c97bf7")
-
-        scrollbar = ttk.Scrollbar(log_wrap, orient=tk.VERTICAL,
-                                  command=self.log_box.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_box.config(yscrollcommand=scrollbar.set)
-
-        # ── progress bar ──────────────────────────────────────────────────────
-        prog_frame = tk.Frame(right, bg=BG_DARK)
-        prog_frame.pack(fill=tk.X, pady=(4, 0))
-
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(
-            "QA.Horizontal.TProgressbar",
-            troughcolor=BG_PANEL,
-            background=ACCENT,
-            bordercolor=BG_PANEL,
-            lightcolor=ACCENT,
-            darkcolor=ACCENT,
-        )
-        self._progress = ttk.Progressbar(
-            prog_frame,
-            style="QA.Horizontal.TProgressbar",
-            orient=tk.HORIZONTAL,
-            mode="indeterminate",
-            length=200,
-        )
-        self._progress.pack(fill=tk.X, padx=0, pady=2)
-
-        # ── status bar ────────────────────────────────────────────────────────
+        # ── status bar — packed to bottom first so it is always visible ───────
         self._status_bar = StatusBar(self)
         self._status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
-    def _build_agent_cards(self, parent) -> None:
-        cards_frame = tk.Frame(parent, bg=BG_DARK)
-        cards_frame.pack(fill=tk.X, pady=2)
+        tk.Frame(self, bg=ACCENT, height=2).pack(fill=tk.X, side=tk.BOTTOM)
 
-        for title, model, color, icon, side_pad in [
-            ("Agent 1", "Claude Opus — Rules", "#c97bf7", "🧠", (0, 4)),
-            ("Agent 2", "Claude Haiku — QA",   "#c97bf7", "🧠", (4, 0)),
-        ]:
-            card = tk.Frame(cards_frame, bg=BG_CARD)
-            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
-                      padx=side_pad)
+        # ── notebook ──────────────────────────────────────────────────────────
+        style = ttk.Style()
+        style.theme_use("clam")
 
-            strip = tk.Frame(card, bg=color, width=3)
-            strip.pack(side=tk.LEFT, fill=tk.Y)
-            strip.pack_propagate(False)
+        style.configure(
+            "QA.TNotebook",
+            background=BG_DARK,
+            borderwidth=0,
+            tabmargins=[0, 0, 0, 0],
+        )
+        style.configure(
+            "QA.TNotebook.Tab",
+            background=BG_PANEL,
+            foreground=TEXT_SECONDARY,
+            font=("Segoe UI", 9, "bold"),
+            padding=[18, 8],
+            borderwidth=0,
+            focuscolor=BG_DARK,
+        )
+        style.map(
+            "QA.TNotebook.Tab",
+            background=[
+                ("selected", BG_DARK),
+                ("active",   BG_CARD),
+            ],
+            foreground=[
+                ("selected", TEXT_PRIMARY),
+                ("active",   TEXT_PRIMARY),
+            ],
+            expand=[("selected", [0, 0, 0, 2])],
+        )
 
-            inner = tk.Frame(card, bg=BG_CARD, padx=10, pady=8)
-            inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._notebook = ttk.Notebook(self, style="QA.TNotebook")
+        self._notebook.pack(fill=tk.BOTH, expand=True)
 
-            tk.Label(inner, text=f"{icon} {title}", bg=BG_CARD,
-                     fg=color, font=("Segoe UI", 8, "bold")).pack(anchor="w")
-            tk.Label(inner, text=model, bg=BG_CARD,
-                     fg=TEXT_SECONDARY, font=("Segoe UI", 8)).pack(anchor="w")
+        # Tab 1 — QA Reviewer (shell, disabled)
+        self._tab1 = Tab1Frame(self._notebook, self._status_bar)
+        self._notebook.add(self._tab1, text="  Indeed Proto QA Reviewer  ")
 
-    # ── logging ───────────────────────────────────────────────────────────────
-    def _log(self, text: str, level: str = "info") -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
-        if level == "info":
-            tl = text.lower()
-            if "error" in tl or "fail" in tl:
-                level = "error"
-            elif "gemini" in tl or "agent 1" in tl:
-                level = "agent1"
-            elif "claude" in tl or "agent 2" in tl:
-                level = "agent2"
-            elif "complet" in tl or "finish" in tl or "done" in tl:
-                level = "success"
-            elif "warning" in tl or "fallback" in tl or "missing" in tl:
-                level = "warning"
+        # Tab 2 — Metric System (active)
+        self._tab2 = Tab2Frame(self._notebook, self._status_bar)
+        self._notebook.add(self._tab2, text="  METRIC SYSTEM  ")
 
-        self.log_box.config(state=tk.NORMAL)
-        self.log_box.insert(tk.END, f"[{stamp}]  ", "time")
-        self.log_box.insert(tk.END, f"{text}\n", level)
-        self.log_box.see(tk.END)
-        self.log_box.config(state=tk.DISABLED)
-        self.update_idletasks()
+        # Tab 3 — DNT r3 (placeholder)
+        self._tab3 = self._build_placeholder_tab("DNT (r3)")
+        self._notebook.add(self._tab3, text="  DNT (r3)  ")
 
-    def _clear_log(self) -> None:
-        self.log_box.config(state=tk.NORMAL)
-        self.log_box.delete("1.0", tk.END)
-        self.log_box.config(state=tk.DISABLED)
+        # Open on Tab 2 by default
+        self._notebook.select(1)
 
-    # ── workflow ──────────────────────────────────────────────────────────────
-    def run_workflow(self) -> None:
-        threading.Thread(target=self._run_workflow_inner, daemon=True).start()
+    def _build_placeholder_tab(self, title: str) -> tk.Frame:
+        frame = tk.Frame(self._notebook, bg=BG_DARK)
 
-    def _run_workflow_inner(self) -> None:
-        try:
-            self._status_bar.set("Running workflow…", "running")
-            self._progress.start(12)
-            self._log("Starting 2-agent QA workflow…")
+        tk.Frame(frame, bg=BG_DARK, height=80).pack()
 
-            article_dir = Path(self.row_articles.get())
-            ref_dir     = Path(self.row_refs.get())
-            spot_dir    = Path(self.row_spots.get())
-            out_dir     = Path(self.row_output.get())
-            env_file    = Path(self.row_env.get())
+        tk.Label(
+            frame, text="⬡",
+            bg=BG_DARK, fg=ACCENT_DIM,
+            font=("Segoe UI", 48),
+        ).pack()
 
-            if not article_dir.exists() or not ref_dir.exists() or not spot_dir.exists():
-                raise ValueError("Please select valid article / reference / spotcheck folders.")
-            if not env_file.exists():
-                raise ValueError("Please select a valid .env file.")
+        tk.Label(
+            frame, text=title,
+            bg=BG_DARK, fg=TEXT_PRIMARY,
+            font=("Segoe UI", 18, "bold"),
+        ).pack(pady=(12, 4))
 
-            env           = load_env_file(env_file)
-            google_key    = env.get("GOOGLE_API_KEY", "")
-            anthropic_key = env.get("ANTHROPIC_API_KEY", "")
-            agent_cfg     = load_agent_settings(DEFAULT_MOSAIQ_CONFIG)
+        tk.Label(
+            frame,
+            text="This module is under development.",
+            bg=BG_DARK, fg=TEXT_SECONDARY,
+            font=("Segoe UI", 10),
+        ).pack()
 
-            self._log(
-                f"Agent settings — step1: {agent_cfg['step1_model']} "
-                f"(T={agent_cfg['step1_temp']})  |  "
-                f"step2: {agent_cfg['step2_model']} (T={agent_cfg['step2_temp']})"
-            )
+        tk.Label(
+            frame, text="Coming soon.",
+            bg=BG_DARK, fg=TEXT_MUTED,
+            font=("Segoe UI", 9),
+        ).pack(pady=(2, 0))
 
-            articles = list_docx(article_dir)
-            refs     = list_docx(ref_dir)
-            spots    = list_docx(spot_dir)
+        tk.Frame(frame, bg=BG_DARK, height=24).pack()
+        tk.Frame(frame, bg=ACCENT_DIM, height=2, width=120).pack()
 
-            if not articles:
-                raise ValueError("No article .docx files found in the selected folder.")
+        return frame
 
-            self._log(
-                f"Discovered  {len(articles)} article(s)  ·  "
-                f"{len(refs)} reference(s)  ·  {len(spots)} spot-check(s)"
-            )
 
-            extraction_dir = out_dir / "extracted"
-            annotated_dir  = out_dir / "annotated_articles"
-            extraction_dir.mkdir(parents=True, exist_ok=True)
-            annotated_dir.mkdir(parents=True, exist_ok=True)
-
-            article_payload: List[Tuple[str, str, Path]] = []
-            ref_payload:     List[Tuple[str, str]]       = []
-            spot_payload:    List[Tuple[str, str]]        = []
-            wc_rows:         List[dict]                   = []
-
-            for p in articles:
-                text = docx_to_text(p)
-                wc   = word_count(text)
-                article_payload.append((p.name, text, p))
-                wc_rows.append({"File": p.name, "Category": "Article", "WordCount": wc})
-                save_json(extraction_dir / "articles" / f"{p.stem}.json",
-                          {"file": p.name, "text": text})
-
-            for p in refs:
-                text = docx_to_text(p)
-                ref_payload.append((p.name, text))
-                wc_rows.append({"File": p.name, "Category": "Reference",
-                                 "WordCount": word_count(text)})
-                save_json(extraction_dir / "references" / f"{p.stem}.json",
-                          {"file": p.name, "text": text})
-
-            for p in spots:
-                text = docx_to_text(p)
-                spot_payload.append((p.name, text))
-                wc_rows.append({"File": p.name, "Category": "SpotCheck",
-                                 "WordCount": word_count(text)})
-                save_json(extraction_dir / "spotchecks" / f"{p.stem}.json",
-                          {"file": p.name, "text": text})
-
-            self._log("Extraction complete — DOCX → JSON")
-
-            # ── Agent 1: Gemini ───────────────────────────────────────────────
-            # ── Agent 1: Claude (rules extraction) ───────────────────────────
-            if anthropic_key:
-                try:
-                    self._log("Calling Agent 1 (Claude) — generating QA rules…")
-                    rules_bundle = call_claude_extract_rules(
-                        anthropic_key,
-                        ref_payload,
-                        spot_payload,
-                        agent_cfg["step1_model"],
-                        agent_cfg["step1_temp"],
-                    )
-                except Exception as e:
-                    self._log(f"Claude Agent 1 failed — using fallback rules  ({e})")
-                    rules_bundle = fallback_rules(ref_payload, spot_payload)
-            else:
-                self._log("ANTHROPIC_API_KEY not found — using fallback rules")
-                rules_bundle = fallback_rules(ref_payload, spot_payload)
-
-            rules_bundle = normalize_rules_bundle(rules_bundle, ref_payload, spot_payload)
-            qa_rules = rules_bundle.get("qa_rules", [])
-            save_json(out_dir / "qa_rules.json", rules_bundle)
-            self._log(f"QA rules ready  ({len(qa_rules)} rule(s))")
-
-            # ── Agent 2: Claude ───────────────────────────────────────────────
-            assessments: List[ArticleAssessment] = []
-            for idx, (name, text, source_path) in enumerate(article_payload, 1):
-                self._log(
-                    f"Agent 2 (Claude) — assessing "
-                    f"[{idx}/{len(article_payload)}]  {name}"
-                )
-                if anthropic_key:
-                    try:
-                        a = call_claude_assess_article(
-                            anthropic_key, name, text, qa_rules,
-                            agent_cfg["step2_model"], agent_cfg["step2_temp"],
-                        )
-                    except Exception as e:
-                        self._log(f"Claude failed for {name} — fallback  ({e})")
-                        a = fallback_assessment(name, text, qa_rules)
-                else:
-                    self._log(f"ANTHROPIC_API_KEY missing — fallback for {name}")
-                    a = fallback_assessment(name, text, qa_rules)
-# test
-                assessments.append(a)
-                ann_path = annotated_dir / f"{source_path.stem}_annotated.docx"
-                create_annotated_docx(source_path, ann_path, a.issues)
-                self._log(f"Annotated DOCX saved → {ann_path.name}")
-
-            # ── reports ───────────────────────────────────────────────────────
-            save_summary_docx(out_dir / "issues_summary.docx", assessments)
-            build_excel_report(out_dir / "qa_readiness_report.xlsx",
-                               assessments, wc_rows)
-
-            issues_flat = [
-                {
-                    "article":        i.article,
-                    "severity":       i.severity,
-                    "rule_id":        i.rule_id,
-                    "rule":           i.rule,
-                    "source_refs":    i.source_refs,
-                    "source_files":   i.source_files,
-                    "evidence":       i.evidence,
-                    "recommendation": i.recommendation,
-                }
-                for a in assessments for i in a.issues
-            ]
-            save_json(out_dir / "issues.json", {"issues": issues_flat})
-
-            self._log(f"Workflow complete — output saved to: {out_dir}")
-            self._progress.stop()
-            self._status_bar.set("Completed successfully", "ok")
-            messagebox.showinfo(
-                "Done",
-                f"QA workflow completed.\n\nOutput folder:\n{out_dir}",
-            )
-
-        except Exception as e:
-            self._progress.stop()
-            self._status_bar.set(f"Failed: {e}", "error")
-            self._log(f"Fatal error: {e}")
-            messagebox.showerror("Error", str(e))
-
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     app = App()
